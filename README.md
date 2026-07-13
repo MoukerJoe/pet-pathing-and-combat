@@ -1,35 +1,32 @@
 # Pet Pathing and Combat
 
-A cosmetic RuneLite plugin that makes your follower pet **keep pace with you** instead of trailing a couple of tiles behind, and (optionally) lets your pet **stand in for your Arceuus thralls** in combat.
+Your pet finally keeps up with you.
 
-Everything is purely client-side and visual. Nothing is sent to the server, no input is generated, and other players see your pet exactly as they normally would.
+Pets have trailed 2-3 tiles behind players since forever. This plugin makes your pet move like an actual companion — it stays right behind you, walks when you walk, runs when you run, and turns where you turn. Works with every pet in the game (boss pets, metamorphs, skilling pets, all of them) with zero setup.
 
-## What it does
+It can also make your pet fight as your thrall. Summon a thrall and your pet takes its place — it runs over, attacks whatever the thrall is attacking using its own attack animation, then comes back to your side when the thrall expires.
 
-- **Tighter following.** While you move, the real (server-controlled) pet is hidden and a client-side "ghost" copy of it is drawn following your on-screen path about one tile back, matching your walk/run speed with natural acceleration, turning, and idle settling. When you stop, control is handed back to the real pet so you can right-click it as usual.
-- **Pixel-accurate.** The ghost mirrors your real pet's own model, so it is the correct size, colour, and animation for any pet — including metamorphosis/boss pets — with no per-pet setup.
-- **Thrall impersonation (optional).** When you cast an Arceuus Resurrection spell, the summoned thrall is hidden and your pet takes its place: it rides the thrall's real position and facing (so pathing and targeting stay authentic) and plays its own attack animation each time the thrall attacks. When the thrall expires, your pet returns to your side. Works across teleports and render-range loss.
-- **Call Follower interaction (optional).** Using the *Call Follower* option briefly reveals the real pet so you can right-click it (Pick up / Metamorphosis).
+Everything is client-side and visual only. Your real pet and thrall still exist and behave like normal underneath — other players see nothing different, and nothing is sent to the server.
+
+<!-- drag Comparison.gif here -->
+
+<!-- drag Thrall Showcase.gif here -->
 
 ## Settings
 
-| Option | Default | Description |
-| --- | --- | --- |
-| Hand back when idle | On | When you stand still, walk the pet onto the real pet's spot and hand control back so it's clickable. |
-| Idle handoff delay | 25 ticks | How long you must stand still before the hand-back begins. |
-| Interact on Call Follower | On | Briefly show the real pet when you use *Call Follower*. |
-| Pet impersonates thralls | On | Let your pet stand in for Arceuus thralls. |
+- **Hand back when idle** — when you stand still for a bit, control goes back to the real pet so you can right-click it (pick up, metamorphosis, etc.)
+- **Idle handoff delay** — how long you stand still before that happens
+- **Interact on Call Follower** — using Call Follower shows the real pet for a few seconds so you can click it
+- **Pet impersonates thralls** — toggle the thrall feature
 
-## Limitations
+## Known quirks
 
-- It's cosmetic only — it does **not** change how far the *real* pet is, only what you see. The real pet still follows at its normal speed underneath.
-- Magic (ghostly) thralls sometimes attack with only a projectile and no animation; those attacks still fire the pet's attack animation via projectile detection, but very unusual thralls may not.
-- During a scene reload (region change / long teleport) the real pet isn't rendered for a moment; the ghost briefly disappears and reappears with a small reorient when the pet renders again, matching how the game itself pops pets in.
+- It's cosmetic only — the real pet is still trailing behind under the hood, so nothing about game mechanics changes.
+- If your pet leaves render distance (long runs, teleports) it pops back in behind you, same as pets normally do.
+- Occasionally a thrall attack won't trigger the pet's attack animation — some magic thrall attacks have no animation to detect.
 
 ## Credits
 
-Pet attack-animation IDs are derived from the data table in the
-[Companion Pets plugin](https://github.com/Mrnice98/Companion-Pets-Plugin) by
-Mrnice98 (BSD 2-Clause).
+Pet attack animation IDs come from the [Companion Pets plugin](https://github.com/Mrnice98/Companion-Pets-Plugin) by Mrnice98.
 
-Portions of this plugin were developed with the assistance of AI.
+Built with some AI assistance.
