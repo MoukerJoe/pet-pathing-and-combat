@@ -20,6 +20,8 @@ Everything is client-side and visual only. Your real pet and thrall still exist 
 - **Idle handoff delay** — how long you stand still before that happens
 - **Interact on Call Follower** — using Call Follower shows the real pet for a few seconds so you can click it
 - **Pet impersonates thralls** — toggle the thrall feature
+- **Turn speed** — how fast the pet rotates when changing direction, if you want lazier or snappier turns
+- **Pet watches you** — the pet leans toward you through turns and looks at you when it stops
 
 ## Known quirks
 
