@@ -2,7 +2,7 @@
 
 Your pet finally keeps up with you.
 
-Pets have trailed 2-3 tiles behind players since forever. This plugin makes your pet move like an actual companion. They stay right behind you, walks when you walk, runs when you run, and turns where you turn. Works with every pet in the game (boss pets, metamorphs, skilling pets, all of them) with zero setup.
+Pets have trailed 2-3 tiles behind players since forever. This plugin makes your pet move like an actual companion. They stay right behind you, walks when you walk, runs when you run, and turns where you turn. Zero setup required.
 
 It can also make your pet fight as your thrall. Summon a thrall and your pet takes its place. It runs over, attacks whatever the thrall is attacking using its own attack animation, then comes back to your side when the thrall expires.
 
