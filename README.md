@@ -1,6 +1,6 @@
 # Pet Pathing and Combat
 
-A cosmetic RuneLite plugin that makes your follower pet **keep pace with you** instead of trailing a couple of tiles behind, and (optionally) lets your pet **stand in for your Arceuus thralls** in combat.
+A cosmetic RuneLite plugin that makes your follower pet **keep pace with you** instead of trailing a couple of tiles behind, and (optionally) lets your pet **stand in for your  thralls** in combat.
 
 Everything is purely client-side and visual. Nothing is sent to the server, no input is generated, and other players see your pet exactly as they normally would.
 
@@ -10,6 +10,14 @@ Everything is purely client-side and visual. Nothing is sent to the server, no i
 - **Pixel-accurate.** The ghost mirrors your real pet's own model, so it is the correct size, colour, and animation for any pet — including metamorphosis/boss pets — with no per-pet setup.
 - **Thrall impersonation (optional).** When you cast an Arceuus Resurrection spell, the summoned thrall is hidden and your pet takes its place: it rides the thrall's real position and facing (so pathing and targeting stay authentic) and plays its own attack animation each time the thrall attacks. When the thrall expires, your pet returns to your side. Works across teleports and render-range loss.
 - **Call Follower interaction (optional).** Using the *Call Follower* option briefly reveals the real pet so you can right-click it (Pick up / Metamorphosis).
+
+<img width="620" height="240" alt="Comparison" src="https://github.com/user-attachments/assets/7b963a9e-06f0-4af5-8843-8e29ddee9a80" />
+
+<img width="640" height="330" alt="Run Showcase" src="https://github.com/user-attachments/assets/325c0ab3-3f70-4da0-aa33-5c9f457222b6" />
+
+<img width="520" height="308" alt="Thrall Showcase" src="https://github.com/user-attachments/assets/1aed0b70-8be2-4b94-8f95-fe2e36f63038" />
+
+
 
 ## Settings
 
