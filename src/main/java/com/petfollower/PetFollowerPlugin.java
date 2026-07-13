@@ -115,6 +115,21 @@ public class PetFollowerPlugin extends Plugin
 	// left-right-left corrections.
 	private static final float LOOKAHEAD = 80f;
 
+	// The recorded follow-path is low-pass filtered toward your real position
+	// with this time constant (ms) before the ghost follows it. Diagonal
+	// running in OSRS is a rapid staircase (one tile forward, one across,
+	// repeating); mirrored exactly at a one-tile gap it made the ghost jerk
+	// left/right every step. Filtering averages that zigzag into the straight
+	// diagonal it approximates, while a sustained turn (rounding an obstacle)
+	// still comes through — it just eases in instead of snapping. Bigger =
+	// smoother, but the ghost trails a little further back.
+	private static final float PATH_SMOOTH_TAU = 150f;
+
+	// A single-frame jump farther than this (local units) is a teleport or
+	// render blip, not real walking: snap the smoother to it instead of
+	// smearing out a long false trail the ghost would slowly slide along.
+	private static final float PATH_SMOOTH_SNAP = 256f;
+
 	// While moving, lean the facing partially toward the player (capped) so
 	// the pet reads as watching you through turns without ever strafing.
 	private static final float PLAYER_BIAS = 0.25f;
@@ -181,6 +196,10 @@ public class PetFollowerPlugin extends Plugin
 	private float ghostX;
 	private float ghostY;
 	private float turnV;
+	// Low-pass state for the recorded follow-path (see PATH_SMOOTH_TAU).
+	private float pathSmoothX;
+	private float pathSmoothY;
+	private boolean pathSmoothInit;
 	private long lastFrameNanos;
 	private int poseState = -1;
 	private boolean docking;
@@ -506,7 +525,6 @@ public class PetFollowerPlugin extends Plugin
 		// (stairs/ladders) reparks it, since there's nothing to walk through.
 		int plane = client.getPlane();
 		PathPoint tail = path.peekLast();
-		float step = tail == null ? 0f : (float) Math.hypot(p.getX() - tail.x, p.getY() - tail.y);
 
 		if (tail == null || plane != pathPlane)
 		{
@@ -514,10 +532,37 @@ public class PetFollowerPlugin extends Plugin
 			return;
 		}
 
+		// Follow a gently smoothed version of your path, not your exact
+		// tile-by-tile positions. Diagonal running is a rapid staircase (one
+		// tile forward, one across, repeating); mirrored exactly at a one-tile
+		// gap the ghost jerked left/right every step. Low-pass filtering the
+		// recorded points averages that zigzag into the straight diagonal it
+		// approximates; a genuine sustained turn still comes through because
+		// it doesn't alternate. A big single-frame jump (teleport/blip) snaps
+		// through rather than smearing a long false trail.
+		if (!pathSmoothInit)
+		{
+			pathSmoothX = p.getX();
+			pathSmoothY = p.getY();
+			pathSmoothInit = true;
+		}
+		else if ((float) Math.hypot(p.getX() - pathSmoothX, p.getY() - pathSmoothY) > PATH_SMOOTH_SNAP)
+		{
+			pathSmoothX = p.getX();
+			pathSmoothY = p.getY();
+		}
+		else
+		{
+			float sc = Math.min(1f, dt / PATH_SMOOTH_TAU);
+			pathSmoothX += (p.getX() - pathSmoothX) * sc;
+			pathSmoothY += (p.getY() - pathSmoothY) * sc;
+		}
+
+		float step = (float) Math.hypot(pathSmoothX - tail.x, pathSmoothY - tail.y);
 		if (step > 0.5f)
 		{
 			playerCum += step;
-			path.addLast(new PathPoint(p.getX(), p.getY(), playerCum));
+			path.addLast(new PathPoint(pathSmoothX, pathSmoothY, playerCum));
 		}
 
 		// Units per ms, smoothed over ~100 ms.
@@ -661,6 +706,7 @@ public class PetFollowerPlugin extends Plugin
 		ghostArc = 0f;
 		ghostV = 0f;
 		playerSpeed = 0f;
+		pathSmoothInit = false;
 	}
 
 	// ------------------------------------------------------------------
@@ -1082,6 +1128,7 @@ public class PetFollowerPlugin extends Plugin
 		playerSpeed = 0f;
 		ghostArc = 0f;
 		ghostV = 0f;
+		pathSmoothInit = false;
 
 		if (ghost != null)
 		{
@@ -1272,6 +1319,7 @@ public class PetFollowerPlugin extends Plugin
 		turnV = 0f;
 		poseState = -1;
 		docking = false;
+		pathSmoothInit = false;
 	}
 
 	private void place(LocalPoint at, int plane)
