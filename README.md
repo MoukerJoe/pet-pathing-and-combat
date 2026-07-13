@@ -2,11 +2,11 @@
 
 Your pet finally keeps up with you.
 
-Pets have trailed 2-3 tiles behind players since forever. This plugin makes your pet move like an actual companion — it stays right behind you, walks when you walk, runs when you run, and turns where you turn. Works with every pet in the game (boss pets, metamorphs, skilling pets, all of them) with zero setup.
+Pets have trailed 2-3 tiles behind players since forever. This plugin makes your pet move like an actual companion. They stay right behind you, walks when you walk, runs when you run, and turns where you turn. Zero setup required.
 
-It can also make your pet fight as your thrall. Summon a thrall and your pet takes its place — it runs over, attacks whatever the thrall is attacking using its own attack animation, then comes back to your side when the thrall expires.
+It can also make your pet fight as your thrall. Summon a thrall and your pet takes its place. It runs over, attacks whatever the thrall is attacking using its own attack animation, then comes back to your side when the thrall expires.
 
-Everything is client-side and visual only. Your real pet and thrall still exist and behave like normal underneath — other players see nothing different, and nothing is sent to the server.
+Everything is client-side and visual only. Your real pet and thrall still exist and behave like normal underneath.
 
 <img width="620" height="240" alt="Comparison" src="https://github.com/user-attachments/assets/7b963a9e-06f0-4af5-8843-8e29ddee9a80" />
 
@@ -23,12 +23,14 @@ Everything is client-side and visual only. Your real pet and thrall still exist 
 
 ## Known quirks
 
-- It's cosmetic only — the real pet is still trailing behind under the hood, so nothing about game mechanics changes.
+- It's cosmetic only. The real pet is still trailing behind under the hood, so nothing about game mechanics changes.
 - If your pet leaves render distance (long runs, teleports) it pops back in behind you, same as pets normally do.
-- Occasionally a thrall attack won't trigger the pet's attack animation — some magic thrall attacks have no animation to detect.
+- Not all use cases tested. Please submit bug reports if found and will update ASAP.
+- I do not own any Post-DT2 pets so I am not entirely sure how they will react with this plugin.
+- I do not own many pets so some pets may behave differently or clip because of their model. Please let me know and I will address.
 
 ## Credits
 
 Pet attack animation IDs come from the [Companion Pets plugin](https://github.com/Mrnice98/Companion-Pets-Plugin) by Mrnice98.
 
-Built with some AI assistance.
+Built in part with AI assistance.
