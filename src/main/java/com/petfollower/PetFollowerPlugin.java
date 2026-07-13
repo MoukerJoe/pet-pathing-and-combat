@@ -98,12 +98,31 @@ public class PetFollowerPlugin extends Plugin
 	private static final int POSE_WALK = 1;
 	private static final int POSE_RUN = 2;
 
-	// Turning, in JAU (2048 = full circle) per ms. Angular speed ramps at
-	// TURN_ACCEL so turns sweep in and out instead of rotating at full rate
-	// from the first frame.
-	private static final float TURN_MAX = 1.3f;
-	private static final float TURN_ACCEL = 0.013f;
-	private static final int TURN_DEADBAND = 12;
+	// Turning, in JAU (2048 = full circle) per ms. Proportional steering:
+	// angular speed scales with the remaining angle (closing it over
+	// ~TURN_TAU ms), so it slows as it lines up instead of overshooting and
+	// hunting back and forth ("wavy"). TURN_ACCEL ramps changes in angular
+	// speed so turns ease in and out. Max speed comes from the config
+	// slider (degrees/sec -> JAU/ms).
+	private static final float DEG_PER_SEC_TO_JAU_PER_MS = 2048f / 360f / 1000f;
+	private static final float TURN_ACCEL = 0.006f;
+	private static final float TURN_TAU = 260f;
+	private static final int TURN_DEADBAND = 20;
+
+	// Pure-pursuit steering: the ghost aims at a point this far ahead along
+	// the recorded path instead of the segment under its feet, so path kinks
+	// average out and corners become one smooth arc instead of
+	// left-right-left corrections.
+	private static final float LOOKAHEAD = 80f;
+
+	// While moving, lean the facing partially toward the player (capped) so
+	// the pet reads as watching you through turns without ever strafing.
+	private static final float PLAYER_BIAS = 0.25f;
+	private static final int PLAYER_BIAS_CAP = 80;
+
+	// When resting, turn to face the player if more than this far off (JAU),
+	// like a pet watching its owner; deadband stops idle micro-fidgeting.
+	private static final int IDLE_FACE_DEADBAND = 72;
 
 	// Docking: how the ghost hands back to the real pet without a visible
 	// pop — it strolls onto the pet's exact spot, matches its facing, and
@@ -548,6 +567,17 @@ public class PetFollowerPlugin extends Plugin
 			? POSE_IDLE
 			: (vTarget <= RUN_SPEED * 0.7f ? POSE_WALK : POSE_RUN);
 		applyPose(newState);
+
+		// At rest, gently turn to face you — a pet watching its owner. The
+		// wide deadband keeps it from fidgeting at small angles.
+		if (newState == POSE_IDLE && config.watchOwner())
+		{
+			int toPlayer = jau(p.getX() - ghostX, p.getY() - ghostY);
+			if (Math.abs(wrapAngle(toPlayer - ghost.getOrientation())) > IDLE_FACE_DEADBAND)
+			{
+				steer(toPlayer, dt);
+			}
+		}
 	}
 
 	/**
@@ -966,13 +996,55 @@ public class PetFollowerPlugin extends Plugin
 			dirY = b.y - a.y;
 		}
 
-		if (dirX != 0f || dirY != 0f)
+		// Pure pursuit: aim at a point LOOKAHEAD units further along the
+		// path rather than this tiny segment, turning corners into arcs.
+		float lx = nx;
+		float ly = ny;
 		{
-			int desired = jau(dirX, dirY);
+			float lookArc = ghostArc + LOOKAHEAD;
+			PathPoint prev = a;
+			boolean found = false;
+			for (PathPoint pp : path)
+			{
+				if (pp.cum >= lookArc)
+				{
+					float span = pp.cum - prev.cum;
+					float f2 = span <= 0f ? 1f : (lookArc - prev.cum) / span;
+					lx = prev.x + (pp.x - prev.x) * f2;
+					ly = prev.y + (pp.y - prev.y) * f2;
+					found = true;
+					break;
+				}
+				prev = pp;
+			}
+			if (!found)
+			{
+				// Path doesn't extend that far (slowing to a stop): aim at
+				// its end.
+				lx = prev.x;
+				ly = prev.y;
+			}
+		}
+
+		float ldx = lx - nx;
+		float ldy = ly - ny;
+		if (Math.hypot(ldx, ldy) > 4)
+		{
+			int desired = jau(ldx, ldy);
+
+			// Lean the facing a little toward the player so the pet reads
+			// as watching you through the turn (capped: never strafes).
+			Player me = client.getLocalPlayer();
+			LocalPoint mp = config.watchOwner() && me != null ? me.getLocalLocation() : null;
+			if (mp != null)
+			{
+				int toPlayer = jau(mp.getX() - nx, mp.getY() - ny);
+				int bias = (int) (wrapAngle(toPlayer - desired) * PLAYER_BIAS);
+				bias = Math.max(-PLAYER_BIAS_CAP, Math.min(PLAYER_BIAS_CAP, bias));
+				desired = (desired + bias) & 2047;
+			}
+
 			int diff = wrapAngle(desired - ghost.getOrientation());
-			// Deadband: path segments are only a few units long, so integer
-			// rounding wobbles their direction by a few degrees; bleed off
-			// angular speed instead of chasing that noise.
 			if (Math.abs(diff) > TURN_DEADBAND)
 			{
 				steer(desired, dt);
@@ -1280,9 +1352,12 @@ public class PetFollowerPlugin extends Plugin
 		int cur = ghost.getOrientation();
 		int diff = wrapAngle(desired - cur);
 
-		// Angular velocity in JAU/ms, capped so the remaining sweep can't be
-		// overshot within this frame, ramped by TURN_ACCEL.
-		float want = Math.max(-TURN_MAX, Math.min(TURN_MAX, diff / Math.max(dt, 1f)));
+		// Proportional target angular velocity: aim to close the remaining
+		// angle over ~TURN_TAU ms (so it decelerates into alignment rather
+		// than slamming past it), capped by the config slider, ramped by
+		// TURN_ACCEL.
+		float turnMax = config.turnSpeed() * DEG_PER_SEC_TO_JAU_PER_MS;
+		float want = Math.max(-turnMax, Math.min(turnMax, diff / TURN_TAU));
 		float maxDv = TURN_ACCEL * dt;
 		turnV += Math.max(-maxDv, Math.min(maxDv, want - turnV));
 

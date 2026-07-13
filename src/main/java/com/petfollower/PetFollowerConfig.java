@@ -52,4 +52,27 @@ public interface PetFollowerConfig extends Config
 	{
 		return true;
 	}
+
+	@Range(min = 60, max = 360)
+	@ConfigItem(
+		keyName = "turnSpeed",
+		name = "Turn speed (deg/sec)",
+		description = "How fast the pet rotates when changing direction. Lower = lazier, sweeping turns; higher = snappier.",
+		position = 5
+	)
+	default int turnSpeed()
+	{
+		return 180;
+	}
+
+	@ConfigItem(
+		keyName = "watchOwner",
+		name = "Pet watches you",
+		description = "The pet leans its facing toward you through turns and turns to look at you when it stops.",
+		position = 6
+	)
+	default boolean watchOwner()
+	{
+		return true;
+	}
 }
