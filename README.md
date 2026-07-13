@@ -6,7 +6,7 @@ Pets have trailed 2-3 tiles behind players since forever. This plugin makes your
 
 It can also make your pet fight as your thrall. Summon a thrall and your pet takes its place. It runs over, attacks whatever the thrall is attacking using its own attack animation, then comes back to your side when the thrall expires.
 
-Everything is client-side and visual only. Your real pet and thrall still exist and behave like normal underneath. Other players see nothing different, and nothing is sent to the server.
+Everything is client-side and visual only. Your real pet and thrall still exist and behave like normal underneath.
 
 <img width="620" height="240" alt="Comparison" src="https://github.com/user-attachments/assets/7b963a9e-06f0-4af5-8843-8e29ddee9a80" />
 
