@@ -26,6 +26,8 @@ Everything is client-side and visual only. Your real pet and thrall still exist 
 - It's cosmetic only. The real pet is still trailing behind under the hood, so nothing about game mechanics changes.
 - If your pet leaves render distance (long runs, teleports) it pops back in behind you, same as pets normally do.
 - Not all use cases tested. Please submit bug reports if found and will update ASAP.
+- I do not own any Post-DT2 pets so I am not entirely sure how they will react with this plugin.
+- I do not own many pets so some pets may behave differently or clip because of their model. Please let me know and I will address.
 
 ## Credits
 
