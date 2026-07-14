@@ -71,8 +71,8 @@ import net.runelite.client.plugins.PluginDescriptor;
 @Slf4j
 @PluginDescriptor(
 	name = "Pet Pathing and Combat",
-	description = "Cosmetic: your pet keeps pace right behind you and can stand in for Arceuus thralls",
-	tags = {"pet", "follower", "pathing", "combat", "thrall", "cosmetic"}
+	description = "Cosmetic: your pet keeps pace right behind you, can stand in for Arceuus thralls, and can transmog into any pet",
+	tags = {"pet", "follower", "pathing", "combat", "thrall", "cosmetic", "transmog"}
 )
 public class PetFollowerPlugin extends Plugin
 {
@@ -168,11 +168,6 @@ public class PetFollowerPlugin extends Plugin
 	// without fall back to a short forward lunge.
 	private static final float LUNGE_MS = 400f;
 	private static final float LUNGE_DIST = 48f;
-
-	// The real pet NPC leaves render range for a few ticks when you run far
-	// or teleport. Keep the ghost coasting on its cached model this long
-	// before giving up, so it never blinks out and respawns with a spin.
-	private static final int PET_GRACE_TICKS = 10;
 
 	// A thrall that despawns farther than this from you left your render
 	// range (you ran off); nearer than this it expired in view. Governs
@@ -323,7 +318,6 @@ public class PetFollowerPlugin extends Plugin
 	private float prevThrallX;
 	private float prevThrallY;
 	private float lungeMs;
-	private int petMissingTicks;
 	private boolean rescanThrall;
 	private int ghostSize = 1;
 	private float gap = GAP; // effective resting distance for the current pet
@@ -427,11 +421,6 @@ public class PetFollowerPlugin extends Plugin
 				relinkPet(found);
 			}
 			pet = found;
-			petMissingTicks = 0;
-		}
-		else
-		{
-			petMissingTicks++;
 		}
 
 		// Only tear down when the follower is actually GONE (dismissed / picked
@@ -607,7 +596,6 @@ public class PetFollowerPlugin extends Plugin
 			if (found != null)
 			{
 				relinkPet(found);
-				petMissingTicks = 0;
 			}
 			else if (!impersonating)
 			{
@@ -2636,7 +2624,6 @@ public class PetFollowerPlugin extends Plugin
 			hidingReal = false;
 			thrall = null;
 			thrallAttached = false;
-			petMissingTicks = 0;
 			if (!regionChange)
 			{
 				impersonating = false;
