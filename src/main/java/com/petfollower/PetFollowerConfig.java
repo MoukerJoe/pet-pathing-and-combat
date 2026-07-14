@@ -66,12 +66,56 @@ public interface PetFollowerConfig extends Config
 	}
 
 	@ConfigItem(
-		keyName = "watchOwner",
-		name = "Pet watches you",
-		description = "The pet leans its facing toward you through turns and turns to look at you when it stops.",
+		keyName = "transmogPet",
+		name = "Transmog pet",
+		description = "Render your follower as this pet, built from the game cache. Cosmetic and client-side only — only you see it.",
 		position = 6
 	)
-	default boolean watchOwner()
+	default PetTransmog transmog()
+	{
+		return PetTransmog.OFF;
+	}
+
+	@ConfigItem(
+		keyName = "speedTweaksEnabled",
+		name = "Adjust animation speed",
+		description = "Speed up the walk cycle of pets that have no real run animation,<br>"
+			+ "so their feet keep up with the ground.<br>"
+			+ "Turn off to leave every animation exactly as the game plays it.",
+		position = 8
+	)
+	default boolean speedTweaksEnabled()
+	{
+		return true;
+	}
+
+	@Range(min = 100, max = 300)
+	@ConfigItem(
+		keyName = "petSpeed",
+		name = "Pet animation speed (%)",
+		description = "How fast this pet's run animation plays.<br>"
+			+ "100% = vanilla: the animation is not touched at all.<br>"
+			+ "Raise it to speed up the run cycle of pets that have no real<br>"
+			+ "run animation, so their feet keep up with the ground.<br>"
+			+ "The slider always shows and edits the pet currently on screen<br>"
+			+ "(real or transmog), and each pet's value is saved and restored<br>"
+			+ "whenever that pet is out.",
+		position = 9
+	)
+	default int petSpeed()
+	{
+		return 100;
+	}
+
+	@ConfigItem(
+		keyName = "cadenceMessages",
+		name = "Pet speed chat messages",
+		description = "Show a chat message with the loaded speed setting whenever your<br>"
+			+ "displayed pet changes (pet swap or transmog), so you always know<br>"
+			+ "what the current pet is set to.",
+		position = 10
+	)
+	default boolean cadenceMessages()
 	{
 		return true;
 	}

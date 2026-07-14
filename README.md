@@ -6,6 +6,8 @@ Pets have trailed 2-3 tiles behind players since forever. This plugin makes your
 
 It can also make your pet fight as your thrall. Summon a thrall and your pet takes its place. It runs over, attacks whatever the thrall is attacking using its own attack animation, then comes back to your side when the thrall expires.
 
+There's also a transmog (work in progress) — pick any pet from the dropdown in settings and your follower shows up as that pet, with its own animations. Only you see it.
+
 Everything is client-side and visual only. Your real pet and thrall still exist and behave like normal underneath.
 
 <img width="620" height="240" alt="Comparison" src="https://github.com/user-attachments/assets/7b963a9e-06f0-4af5-8843-8e29ddee9a80" />
@@ -22,11 +24,14 @@ Everything is client-side and visual only. Your real pet and thrall still exist 
 - **Pet impersonates thralls** — toggle the thrall feature
 - **Turn speed** — how fast the pet rotates when changing direction, if you want lazier or snappier turns
 - **Pet watches you** — the pet leans toward you through turns and looks at you when it stops
+- **Transmog** — show your follower as any pet (work in progress, see below)
 
 ## Known quirks
 
 - It's cosmetic only. The real pet is still trailing behind under the hood, so nothing about game mechanics changes.
 - If your pet leaves render distance (long runs, teleports) it pops back in behind you, same as pets normally do.
+- Transmog is a work in progress. Most pets look right but a few animate strangely (Chaos Elemental Jr. for example). It also gets better on its own: whenever you have a real pet out, the plugin learns its true animations and uses them for that transmog from then on.
+- If you use 117HD, its pet light glows where the real (hidden) pet is rather than on the displayed one. That light belongs to 117HD and can't be moved by this plugin.
 - Not all use cases tested. Please submit bug reports if found and will update ASAP.
 - I do not own any Post-DT2 pets so I am not entirely sure how they will react with this plugin.
 - I do not own many pets so some pets may behave differently or clip because of their model. Please let me know and I will address.
