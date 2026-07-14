@@ -10,11 +10,9 @@ There's also a transmog (work in progress) — pick any pet from the dropdown in
 
 Everything is client-side and visual only. Your real pet and thrall still exist and behave like normal underneath.
 
-<img width="620" height="240" alt="Comparison" src="https://github.com/user-attachments/assets/7b963a9e-06f0-4af5-8843-8e29ddee9a80" />
+## Demo
 
-<img width="640" height="330" alt="Run Showcase" src="https://github.com/user-attachments/assets/325c0ab3-3f70-4da0-aa33-5c9f457222b6" />
-
-<img width="520" height="308" alt="Thrall Showcase" src="https://github.com/user-attachments/assets/1aed0b70-8be2-4b94-8f95-fe2e36f63038" />
+<!-- Drag Plugin-github.mp4 onto the line below when editing on GitHub, then delete this comment. -->
 
 ## Settings
 
