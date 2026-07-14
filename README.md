@@ -12,7 +12,9 @@ Everything is client-side and visual only. Your real pet and thrall still exist 
 
 ## Demo
 
-<!-- Drag Plugin-github.mp4 onto the line below when editing on GitHub, then delete this comment. -->
+
+https://github.com/user-attachments/assets/cd818424-bb20-476c-a53f-465ae89cea7f
+
 
 ## Settings
 
