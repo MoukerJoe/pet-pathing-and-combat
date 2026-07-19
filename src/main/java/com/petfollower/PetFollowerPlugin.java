@@ -1,13 +1,25 @@
 package com.petfollower;
 
 import com.google.inject.Provides;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.image.BufferedImage;
+import java.lang.reflect.Field;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Set;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Actor;
+import net.runelite.api.ActorSpotAnim;
 import net.runelite.api.Animation;
 import net.runelite.api.AnimationController;
 import net.runelite.api.ChatMessageType;
@@ -15,6 +27,8 @@ import net.runelite.api.Client;
 import net.runelite.api.CollisionData;
 import net.runelite.api.CollisionDataFlag;
 import net.runelite.api.GameState;
+import net.runelite.api.ItemComposition;
+import net.runelite.api.JagexColor;
 import net.runelite.api.Model;
 import net.runelite.api.ModelData;
 import net.runelite.api.NPC;
@@ -31,6 +45,7 @@ import net.runelite.api.events.AnimationChanged;
 import net.runelite.api.events.BeforeRender;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
+import net.runelite.api.events.HitsplatApplied;
 import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.NpcDespawned;
 import net.runelite.api.events.NpcSpawned;
@@ -40,8 +55,14 @@ import net.runelite.client.callback.Hooks;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.PluginManager;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.ui.overlay.OverlayPosition;
 
 /**
  * Visual-only pet follower.
@@ -96,7 +117,6 @@ public class PetFollowerPlugin extends Plugin
 	private static final float IDLE_PUSHBACK = 24f; // small extra rest gap so pets don't nose into you
 	private static final float START_DIST = 40f;    // reaction: don't move until you pull this far past gap
 	private static final float STOP_DIST = 12f;     // settle: stop once within this of gap
-	private static final float CATCHUP_DIST = 96f;  // beyond this past gap, sprint to catch up
 	private static final float WALK_SPEED = 128f / 600f;
 	private static final float RUN_SPEED = 256f / 600f;
 	private static final float CATCHUP_SPEED = RUN_SPEED * 1.25f;
@@ -122,6 +142,17 @@ public class PetFollowerPlugin extends Plugin
 	// average out and corners become one smooth arc instead of
 	// left-right-left corrections.
 	private static final float LOOKAHEAD = 80f;
+
+	// Route straightening ("string pulling"): each frame the ghost bridges
+	// straight to a point this far ahead on its route whenever the route is
+	// more than BRIDGE_SLACK longer than the straight chord AND the chord
+	// is walkable. Real animals cut inside corners rather than tracing your
+	// footsteps through the elbow; this collapses 90-degree elbows into the
+	// inside diagonal and merges zigzag micro-folds into one line (which
+	// also stops the left-right facing whip). Collision checking keeps
+	// corners around walls/fences honest — those still trace the path.
+	private static final float BRIDGE_LOOK = 192f;
+	private static final float BRIDGE_SLACK = 20f;
 
 	// The recorded follow-path is low-pass filtered toward your real position
 	// with this time constant (ms) before the ghost follows it. Diagonal
@@ -190,6 +221,9 @@ public class PetFollowerPlugin extends Plugin
 	@Inject private Hooks hooks;
 	@Inject private PetFollowerConfig config;
 	@Inject private ConfigManager configManager;
+	@Inject private PluginManager pluginManager;
+	@Inject private ItemManager itemManager;
+	@Inject private OverlayManager overlayManager;
 
 	private final Hooks.RenderableDrawListener drawListener = this::shouldDraw;
 
@@ -208,6 +242,23 @@ public class PetFollowerPlugin extends Plugin
 
 	private float ghostArc;
 	private float ghostV;
+
+	// Set when a scene load interrupts an ACTIVE follow: the next ghost
+	// spawn starts already in motion. Spawning stationary put the
+	// standing-start reaction beat where it doesn't belong — after a
+	// mid-run zone reload the pet popped in and stood staring for the
+	// style's whole reaction distance (worst on Loose, ~2 tiles).
+	private boolean resumeAtSpeed;
+
+	// Scene-reload translation: LOADING shifts the local coordinate origin;
+	// rather than tearing the ghost down we translate its whole local-space
+	// state by the base delta on the next rendered frame. lastBaseX/Y hold
+	// the PRE-load scene base — they only update on rendered LOGGED_IN
+	// frames, which never happen mid-load, so a chain of reloads still
+	// resolves as one cumulative delta.
+	private boolean pendingSceneShift;
+	private int lastBaseX;
+	private int lastBaseY;
 	private float ghostX;
 	private float ghostY;
 	private float turnV;
@@ -293,6 +344,21 @@ public class PetFollowerPlugin extends Plugin
 	private boolean previewing;
 	private int activePreviewId = -1;
 	private long blipAttackUntil;
+	private long lastPetAttackMs;
+
+	// Following style: parameters swapped per the config enum, applied at
+	// the existing use sites. Medium/Loose also give the trailing distance
+	// a slow random drift (gapDrift, eased toward a retargeted goal every
+	// few seconds) — bounded variance in the resting geometry only, so
+	// pathing, wall handling, and catch-up stay exactly as Strong.
+	private float followStartDist = START_DIST;
+	private float followSlope = 350f;
+	private float followSmoothTau = PATH_SMOOTH_TAU;
+	private int followSettleTicks = 2;
+	private float gapDrift;
+	private float gapDriftTarget;
+	private long gapDriftRetargetMs;
+	private final java.util.Random followRng = new java.util.Random();
 
 	// Per-pet run-cadence tuning. The one config slider always shows and
 	// edits the pet currently displayed; each pet's value is persisted under
@@ -301,6 +367,24 @@ public class PetFollowerPlugin extends Plugin
 	private int petSpeedPct = 100;
 	private int speedKeyId = -1;
 	private boolean syncingSpeedUi;
+
+	// --- 117HD pet-light shim (reflection) -----------------------------
+	// 117HD attaches glow lights to some pets, positioned at the REAL
+	// (hidden) pet — a floating glow where nothing is drawn. It exposes no
+	// API to move or hide a single light, so this shim lifts OUR pet's
+	// (and hidden thrall's) Light objects out of 117HD's live scene-light
+	// list while ghosting, and puts the SAME objects back on handback.
+	// Scoped to the followed pet only — every other NPC light untouched.
+	// Fails safe: any mismatch with 117HD's internals disables the shim
+	// for the session (worst case = the old floating light, never a crash).
+	private boolean hdShimFailed;
+	private Object hdPluginInstance;
+	private java.lang.reflect.Method hdGetSceneContext; // HdPlugin.getSceneContext() (public)
+	private Field hdLightsField;         // SceneContext.lights — the RENDERED lights
+	private Field hdLightActorField;     // Light.actor
+	private final List<Object> hdStashed = new ArrayList<>();
+	private Object hdStashContext;       // SceneContext the stash was taken from
+	private long hdNextInitMs;
 
 	// Beside-the-owner rest: when you stop, the ghost breaks off the walked
 	// line for its last half-tile and settles on a free adjacent tile
@@ -318,7 +402,115 @@ public class PetFollowerPlugin extends Plugin
 	private float prevThrallX;
 	private float prevThrallY;
 	private float lungeMs;
+	private Projectile lastThrallProjectile;
 	private boolean rescanThrall;
+
+	// Thrall projectile tint: the REAL projectile keeps flying, animating,
+	// and rendering itself — every frame we repaint its live posed model's
+	// face colors (hue/saturation to the config color, luminance kept, so
+	// the shading survives). Same philosophy as mirroring the pet's live
+	// model: never rebuild what the engine already built, just touch it up.
+	// (Building a tinted copy from the cache spotanim def was tried and
+	// fails: getIndexConfig().loadData returns null for spotanim configs.)
+	private final Set<Projectile> tintedBolts = new HashSet<>();
+	private boolean tintFailed;
+
+	// The engine CACHES posed spotanim models and reuses them, so everything
+	// we repaint is snapshotted first and restored on toggle-off / color
+	// change / scene load. CRUCIAL: posed animation frames SHARE one set of
+	// face-color arrays (posing moves vertices, never colors), so the
+	// snapshot is keyed by the color ARRAY's identity, not the Model's —
+	// Model-keyed snapshots capture already-tinted colors as "originals"
+	// and make restoration order-dependent.
+	private final IdentityHashMap<int[], TintSnapshot> tintOriginals = new IdentityHashMap<>();
+
+	private static final class TintSnapshot
+	{
+		final int[] a1, a2, a3; // the live (shared) arrays we repaint
+		final int[] o1, o2, o3; // pristine copies taken before any tint
+
+		TintSnapshot(int[] a1, int[] a2, int[] a3)
+		{
+			this.a1 = a1;
+			this.a2 = a2;
+			this.a3 = a3;
+			o1 = a1.clone();
+			o2 = a2.clone();
+			o3 = a3.clone();
+		}
+	}
+
+	// Impact splash on the thrall's victim: the spotanim that starts on the
+	// target actor at the projectile's landing cycle IS our splash (matched
+	// by cycle, no hardcoded ids), and ActorSpotAnim is a Renderable with
+	// its own getModel() — so it gets the same per-frame repaint.
+	private final List<SplashTint> splashTints = new ArrayList<>();
+
+	// One projectile deals ONE hitsplat, so each landing is claimable by
+	// exactly one hitsplat event — otherwise the player's own hit landing
+	// in the same window got tagged too and a duplicate pet icon appeared.
+	private final Set<Projectile> claimedBolts = new HashSet<>();
+
+	private static final class SplashTint
+	{
+		final Actor target;
+		final int impactCycle;
+		boolean hitClaimed;
+
+		SplashTint(Actor target, int impactCycle, boolean hitClaimed)
+		{
+			this.target = target;
+			this.impactCycle = impactCycle;
+			this.hitClaimed = hitClaimed;
+		}
+	}
+
+	// Pet damage icon: a hitsplat that appears on a thrall projectile's
+	// victim within a breath of the landing cycle is the pet's own damage —
+	// show the pet's picture beside it. The picture is the pet's
+	// inventory-item sprite, resolved by scanning item names for the
+	// displayed pet's name (exact first, else the longest item name the pet
+	// name contains: "Corrupted Youngllef" pet -> "Youngllef" item), and
+	// persisted per pet under petItem_<npcId> so the scan runs once ever.
+	private final List<PetHit> petHits = new ArrayList<>();
+	private Overlay petHitOverlay;
+	private BufferedImage petIcon;
+	private int petIconKeyId = -1;
+
+	// The engine stacks up to 4 simultaneous hitsplats per actor in fixed
+	// slots, and the API exposes neither the slots nor their positions —
+	// so this mirrors the engine's bookkeeping from HitsplatApplied events
+	// (first free slot, else evict the oldest; expiry from the hitsplat's
+	// own disappear cycle). Our hit's slot index then positions the icon
+	// beside the RIGHT hitsplat when the player's own damage shares the
+	// target. Weak keys: dead actors clean themselves up.
+	private final java.util.WeakHashMap<Actor, int[]> hitSlots = new java.util.WeakHashMap<>();
+
+	// Stacked-hitsplat geometry, measured from the user's recordings: the
+	// FIRST active hitsplat draws AT the half-logical-height anchor and
+	// each additional one stacks one height (~25 px) straight up — the
+	// stack is NOT centered on the anchor (a centered model put the icon
+	// midway between two splats). A slot's position is its rank among the
+	// currently ACTIVE slots, recomputed every frame as splats expire.
+	private static final int HIT_SLOT_SPACING = 20;
+
+	// No thrall hits above 3 (superior max). A bigger hitsplat can never be
+	// the pet's, which disambiguates most same-tick player+thrall landings.
+	private static final int THRALL_MAX_HIT = 3;
+
+	private static final class PetHit
+	{
+		final Actor target;
+		final int untilCycle; // the hitsplat's own disappear cycle
+		final int slot;
+
+		PetHit(Actor target, int untilCycle, int slot)
+		{
+			this.target = target;
+			this.untilCycle = untilCycle;
+			this.slot = slot;
+		}
+	}
 	private int ghostSize = 1;
 	private float gap = GAP; // effective resting distance for the current pet
 	private boolean ghostShown;
@@ -327,6 +519,7 @@ public class PetFollowerPlugin extends Plugin
 	// stays true even when the thrall NPC is momentarily gone.
 	private boolean impersonating;
 	private int thrallLostTicks;
+	private int thrallDeadlineTick;
 	private int suppressTakeoverTicks;
 
 	// The pet's original pose-animation table, restored on handback. While
@@ -347,15 +540,20 @@ public class PetFollowerPlugin extends Plugin
 	protected void startUp()
 	{
 		hooks.registerRenderableDrawListener(drawListener);
+		petHitOverlay = new PetHitOverlay();
+		overlayManager.add(petHitOverlay);
 	}
 
 	@Override
 	protected void shutDown()
 	{
 		hooks.unregisterRenderableDrawListener(drawListener);
+		overlayManager.remove(petHitOverlay);
 		hidingReal = false;
 		clientThread.invoke(() ->
 		{
+			hdShimRestore();
+			clearTintedBolts();
 			releasePet();
 			despawnGhost();
 			pet = null;
@@ -372,8 +570,11 @@ public class PetFollowerPlugin extends Plugin
 		{
 			return false;
 		}
-		if (thrall != null && renderable == thrall)
+		if (thrall != null && ghost != null && renderable == thrall)
 		{
+			// Hide the thrall only while a ghost actually stands in for it —
+			// with no pet out there is no ghost, and vetoing the thrall then
+			// makes it silently vanish.
 			return false;
 		}
 		return true;
@@ -438,7 +639,17 @@ public class PetFollowerPlugin extends Plugin
 
 		WorldPoint playerTile = me.getWorldLocation();
 		idleTicks = playerTile.equals(lastPlayerTile) ? idleTicks + 1 : 0;
+		// An instant jump this far is a teleport. Thralls never follow
+		// through teleports — the summon is stranded where it was cast.
+		boolean teleported = lastPlayerTile != null
+			&& playerTile.distanceTo2D(lastPlayerTile) > 25;
 		lastPlayerTile = playerTile;
+		if (idleTicks > 2)
+		{
+			// Standing after the reload: the natural reaction beat applies
+			// again to the next start.
+			resumeAtSpeed = false;
+		}
 
 		if (hidingReal)
 		{
@@ -462,6 +673,17 @@ public class PetFollowerPlugin extends Plugin
 		// reverting to a normal pet. Give up only after a long timeout.
 		if (impersonating)
 		{
+			// Unrecoverable: you teleported away (the stranded thrall can
+			// never re-enter range — waiting the full window just kept the
+			// pet hidden for over a minute), or the summon's own timer ran
+			// out while it was off-screen. Resume normal following now.
+			if (teleported || client.getTickCount() > thrallDeadlineTick)
+			{
+				log.debug("Thrall unrecoverable ({}); resuming follow",
+					teleported ? "teleported away" : "timer expired");
+				endThrall();
+				return;
+			}
 			// The real pet must never show while impersonating, even mid-run.
 			hidingReal = true;
 			NPC t = findNearbyThrall(me, THRALL_REACQUIRE_RADIUS);
@@ -471,6 +693,7 @@ public class PetFollowerPlugin extends Plugin
 				thrallAttached = false;
 				lungeMs = 0f;
 				thrallLostTicks = 0;
+				armThrallDeadline();
 				log.debug("Re-acquired thrall id={}", t.getId());
 			}
 			else if (++thrallLostTicks > THRALL_REACQUIRE_TICKS)
@@ -535,6 +758,28 @@ public class PetFollowerPlugin extends Plugin
 	@Subscribe
 	public void onBeforeRender(BeforeRender e)
 	{
+		if (client.getGameState() == GameState.LOGGED_IN)
+		{
+			// Resolve a pending scene-origin shift BEFORE anything touches
+			// local coordinates, then record this frame's base as the new
+			// reference (never updated mid-load, so it stays the PRE-load
+			// base until the shift is applied).
+			if (pendingSceneShift)
+			{
+				pendingSceneShift = false;
+				applySceneShift();
+			}
+			lastBaseX = client.getBaseX();
+			lastBaseY = client.getBaseY();
+		}
+		if (!hidingReal)
+		{
+			// Pet is visible again: hand its 117HD light back.
+			hdShimRestore();
+		}
+		// Bolts in flight outlive state changes (handoff, thrall expiry), so
+		// they update before any early return below.
+		updateTintedBolts();
 		if (!hidingReal || client.getGameState() != GameState.LOGGED_IN)
 		{
 			return;
@@ -551,6 +796,10 @@ public class PetFollowerPlugin extends Plugin
 		{
 			return;
 		}
+
+		// While ghosting, keep our hidden pet's 117HD glow suppressed so it
+		// can't float at the real (invisible) pet's position.
+		hdShimSweep();
 
 		// --- transmog preview state --------------------------------------
 		// When a preview id is set, the follower renders as THAT pet: the
@@ -675,6 +924,7 @@ public class PetFollowerPlugin extends Plugin
 		float dt = (nowNanos - lastFrameNanos) / 1_000_000f; // ms
 		lastFrameNanos = nowNanos;
 		dt = Math.max(0.1f, Math.min(100f, dt));
+		updateFollowStyle(dt);
 
 		if (thrall != null)
 		{
@@ -702,6 +952,7 @@ public class PetFollowerPlugin extends Plugin
 				thrallAttached = false;
 				lungeMs = 0f;
 				thrallLostTicks = 0;
+				armThrallDeadline();
 				showGhost(true);
 				return;
 			}
@@ -779,7 +1030,7 @@ public class PetFollowerPlugin extends Plugin
 		}
 		else
 		{
-			float sc = Math.min(1f, dt / PATH_SMOOTH_TAU);
+			float sc = Math.min(1f, dt / followSmoothTau);
 			pathSmoothX += (p.getX() - pathSmoothX) * sc;
 			pathSmoothY += (p.getY() - pathSmoothY) * sc;
 		}
@@ -819,8 +1070,62 @@ public class PetFollowerPlugin extends Plugin
 			}
 		}
 
+		// --- route straightening (string pulling) -------------------------
+		// See BRIDGE_LOOK. Runs continuously: one bridge per bend — after a
+		// bridge the head of the route IS the chord, so it can't re-trigger
+		// until a new bend enters the window.
+		float bridgeArc = Math.min(ghostArc + BRIDGE_LOOK, playerCum);
+		if (bridgeArc - ghostArc > 64f && path.size() >= 2)
+		{
+			float bx = ghostX;
+			float by = ghostY;
+			PathPoint bprev = path.peekFirst();
+			boolean bfound = false;
+			for (PathPoint pp : path)
+			{
+				if (pp.cum >= bridgeArc)
+				{
+					float span = pp.cum - bprev.cum;
+					float f = span <= 0f ? 1f : (bridgeArc - bprev.cum) / span;
+					bx = bprev.x + (pp.x - bprev.x) * f;
+					by = bprev.y + (pp.y - bprev.y) * f;
+					bfound = true;
+					break;
+				}
+				bprev = pp;
+			}
+			if (!bfound)
+			{
+				bx = bprev.x;
+				by = bprev.y;
+				bridgeArc = bprev.cum;
+			}
+			float along = bridgeArc - ghostArc;
+			float chord = (float) Math.hypot(bx - ghostX, by - ghostY);
+			if (along - chord > BRIDGE_SLACK
+				&& strollClear(ghostX, ghostY, bx, by))
+			{
+				// Rebuild the head of the route as the straight chord; keep
+				// everything beyond the bridge point, distances shifted.
+				Deque<PathPoint> straightened = new ArrayDeque<>();
+				straightened.addLast(new PathPoint(ghostX, ghostY, 0f));
+				straightened.addLast(new PathPoint(bx, by, chord));
+				for (PathPoint pp : path)
+				{
+					if (pp.cum > bridgeArc + 0.5f)
+					{
+						straightened.addLast(new PathPoint(pp.x, pp.y, chord + (pp.cum - bridgeArc)));
+					}
+				}
+				path.clear();
+				path.addAll(straightened);
+				playerCum = chord + (playerCum - bridgeArc);
+				ghostArc = 0f;
+			}
+		}
+
 		// --- decide the ghost's target speed ----------------------------
-		float error = playerCum - gap - ghostArc;
+		float error = playerCum - (gap + gapDrift) - ghostArc;
 
 		// --- break off and settle beside the owner when they stop ---------
 		// Once you're standing and the ghost is within its last half-tile of
@@ -831,7 +1136,7 @@ public class PetFollowerPlugin extends Plugin
 		// Patience beat (idleTicks >= 2): the pet waits ~a second before
 		// repositioning, and also settles from a short-step hold (within a
 		// tile of resting range) — not just from an on-path stop.
-		if (idleTicks >= 2 && !settling && !restDone
+		if (idleTicks >= followSettleTicks && !settling && !restDone
 			&& (error <= STOP_DIST + 64f || directDist < gap + Perspective.LOCAL_TILE_SIZE))
 		{
 			if (chooseRestSpot(me))
@@ -854,13 +1159,18 @@ public class PetFollowerPlugin extends Plugin
 			vTarget = 0f;
 		}
 		else if (ghostV == 0f
-			&& (error < START_DIST
+			&& (error < (resumeAtSpeed ? START_DIST : followStartDist)
 				|| (idleTicks >= 1 && directDist < gap + Perspective.LOCAL_TILE_SIZE)))
 		{
 			// Reaction beat — and short-step patience: a standing owner
 			// shuffling a tile or two doesn't send the pet scurrying after
 			// them at full pace. It waits, and the settle logic repositions
 			// it calmly (or not at all) once you've been still a moment.
+			// After a mid-run zone reload (resumeAtSpeed) the style's full
+			// reaction distance is suppressed for the FIRST start: the ghost
+			// respawns AT its follow spot, so the stop branch above zeroes
+			// it instantly and a Loose/Medium pet then stood staring for its
+			// whole reaction distance right after popping in.
 			vTarget = 0f;
 		}
 		else if (idleTicks >= 1 && error <= 512f)
@@ -881,9 +1191,15 @@ public class PetFollowerPlugin extends Plugin
 			// One smooth curve — the old hard cruise/dash threshold at
 			// CATCHUP_DIST banged the speed up and down around corners,
 			// which read as rubber-banding.
-			float v = playerSpeed + error / 350f;
+			float v = playerSpeed + error / followSlope;
 			float cap = Math.max(CATCHUP_SPEED, error / 700f);
 			vTarget = Math.max(WALK_SPEED * 0.85f, Math.min(cap, v));
+		}
+		if (vTarget > 0f)
+		{
+			// First start after the reload has happened; the style's normal
+			// reaction beat applies from here on.
+			resumeAtSpeed = false;
 		}
 
 		// Pivot before walking: if the path wants the ghost to head somewhere
@@ -904,6 +1220,15 @@ public class PetFollowerPlugin extends Plugin
 			}
 		}
 
+		// Never sprint at point-blank range: catch-up overspeed right next
+		// to you is what reads as the pet LUNGING/slingshotting through
+		// your character whenever its route swings. Far away it can still
+		// dash; nearby it arrives at an honest run.
+		if (directDist < gap * 1.5f)
+		{
+			vTarget = Math.min(vTarget, RUN_SPEED);
+		}
+
 		// Exponential approach (~120 ms time constant) so any target speed,
 		// including big dashes, ramps smoothly.
 		ghostV += (vTarget - ghostV) * Math.min(1f, dt / 120f);
@@ -915,7 +1240,7 @@ public class PetFollowerPlugin extends Plugin
 		// --- advance along the path --------------------------------------
 		if (ghostV > 0f)
 		{
-			ghostArc = Math.min(ghostArc + ghostV * dt, playerCum - gap * 0.75f);
+			ghostArc = Math.min(ghostArc + ghostV * dt, playerCum - (gap + gapDrift) * 0.75f);
 			moveGhostToArc(dt);
 		}
 
@@ -1067,7 +1392,17 @@ public class PetFollowerPlugin extends Plugin
 			float sp = Math.min(WALK_SPEED * dt, d);
 			ghostX += dx / d * sp;
 			ghostY += dy / d * sp;
-			steer(jau(dx, dy), dt);
+			int face = jau(dx, dy);
+			if (config.alwaysFaceOwner())
+			{
+				Player owner = client.getLocalPlayer();
+				LocalPoint op = owner != null ? owner.getLocalLocation() : null;
+				if (op != null)
+				{
+					face = jau(op.getX() - ghostX, op.getY() - ghostY);
+				}
+			}
+			steer(face, dt);
 			place(new LocalPoint(Math.round(ghostX), Math.round(ghostY)), pathPlane);
 			return;
 		}
@@ -1345,10 +1680,22 @@ public class PetFollowerPlugin extends Plugin
 
 		if (!thrallAttached)
 		{
-			if (d > 6f)
+			if (d > Perspective.LOCAL_TILE_SIZE * 12f)
+			{
+				// The ghost is stranded far away (offscreen impersonation
+				// loss, or a resummon while it rode the old thrall): jogging
+				// across the map would leave the new thrall invisible with
+				// nothing standing in — materialize on it instead. The
+				// showGhost also un-hides a ghost hidden during the loss.
+				ghostX = tp.getX();
+				ghostY = tp.getY();
+				showGhost(true);
+			}
+			else if (d > 6f)
 			{
 				// Jog over to take the thrall's place at a normal run pace
 				// (not a jarring sprint), never teleport.
+				showGhost(true);
 				applyPose(POSE_RUN);
 				float sp = Math.min(RUN_SPEED * dt, d);
 				ghostX += dx / d * sp;
@@ -1406,6 +1753,7 @@ public class PetFollowerPlugin extends Plugin
 		thrallAttached = false;
 		thrallSpeed = 0f;
 		lungeMs = 0f;
+		lastThrallProjectile = null;
 		docking = false;
 		impersonating = false;
 		thrallLostTicks = 0;
@@ -1435,8 +1783,21 @@ public class PetFollowerPlugin extends Plugin
 			thrallAttached = false;
 			lungeMs = 0f;
 			thrallLostTicks = 0;
+			armThrallDeadline();
 			log.debug("Re-acquired thrall id={} after scene load", t.getId());
 		}
+	}
+
+	/**
+	 * Latest game tick this summon could still be alive: thralls last your
+	 * Magic level in seconds (level * 5/3 ticks), plus a small buffer.
+	 * Re-armed on every bind — an overestimate only delays the fallback
+	 * release, never hides anything longer than THRALL_REACQUIRE_TICKS.
+	 */
+	private void armThrallDeadline()
+	{
+		int lvl = Math.max(1, client.getBoostedSkillLevel(net.runelite.api.Skill.MAGIC));
+		thrallDeadlineTick = client.getTickCount() + lvl * 5 / 3 + 10;
 	}
 
 	/** Nearest tracked-type thrall within the given tile radius, or null. */
@@ -1488,6 +1849,7 @@ public class PetFollowerPlugin extends Plugin
 		docking = false;
 		impersonating = true;
 		thrallLostTicks = 0;
+		armThrallDeadline();
 	}
 
 	/**
@@ -1509,15 +1871,22 @@ public class PetFollowerPlugin extends Plugin
 	@Subscribe
 	public void onProjectileMoved(ProjectileMoved e)
 	{
-		if (thrall == null)
+		// Everything downstream (attack anim, bolt tint, splash tint, the
+		// damage icon) is pet flavor — a bare thrall fighting as itself
+		// keeps its own colors and gets no icon.
+		if (thrall == null || ghost == null)
 		{
 			return;
 		}
 		Projectile pr = e.getProjectile();
-		// Only react the instant it spawns, and only if it launched from the
-		// thrall's tile — magic (ghostly) thralls attack via projectile with
-		// no animation, which is why animation-based detection missed them.
-		if (pr.getStartCycle() != client.getGameCycle())
+		// React the moment the projectile is REGISTERED (cast time), not when
+		// it launches: the server creates it with startCycle a few cycles in
+		// the future, and that gap is the caster's wind-up. Waiting for
+		// startCycle == gameCycle (the old check) meant the bolt was already
+		// flying before the pet began its swing. The event re-fires every
+		// cycle the projectile exists, so dedupe by identity; the startCycle
+		// bound rejects mid-flight projectiles that drifted over the tile.
+		if (pr == lastThrallProjectile || pr.getStartCycle() < client.getGameCycle())
 		{
 			return;
 		}
@@ -1529,6 +1898,12 @@ public class PetFollowerPlugin extends Plugin
 			return;
 		}
 
+		lastThrallProjectile = pr;
+		// Track regardless of the tint toggle: the flight's landing cycle
+		// also attributes hitsplats for the pet damage icon.
+		log.debug("Thrall projectile id={} start={} end={} now={}",
+			pr.getId(), pr.getStartCycle(), pr.getEndCycle(), client.getGameCycle());
+		tintedBolts.add(pr);
 		triggerPetAttack();
 	}
 
@@ -1543,6 +1918,20 @@ public class PetFollowerPlugin extends Plugin
 		{
 			return;
 		}
+		// One trigger per cast: a thrall that animates fires BOTH paths —
+		// onAnimationChanged at cast, then the projectile at launch — and
+		// the second call restarted the pet's attack animation mid-swing.
+		// First signal wins. The window must beat the LONGEST anim-to-launch
+		// gap: the skeletal thrall's arrow launches well over 900 ms after
+		// its draw animation (the ghostly bolt is much quicker), which is
+		// why the pet repeated its swing on skeleton casts only. Thralls
+		// attack every 4 ticks (2400 ms), so 1800 ms cannot eat a real cast.
+		long now = System.currentTimeMillis();
+		if (now - lastPetAttackMs < 1800)
+		{
+			return;
+		}
+		lastPetAttackMs = now;
 		int atkId = previewing ? activePreviewId : pet.getId();
 		NPCComposition comp = previewing
 			? client.getNpcDefinition(activePreviewId)
@@ -1566,6 +1955,371 @@ public class PetFollowerPlugin extends Plugin
 		{
 			pet.setAnimation(atk);
 			pet.setAnimationFrame(0);
+		}
+	}
+
+	// ------------------------------------------------------------------
+	// Thrall projectile tint
+	// ------------------------------------------------------------------
+
+	/**
+	 * Repaint each tracked projectile's live posed model to the config
+	 * color, every rendered frame. The engine flies, animates, and draws
+	 * its own bolt; we only touch the face colors of the model it is about
+	 * to render. Reapplying is idempotent (hue/saturation are overwritten,
+	 * luminance is preserved), so it doesn't matter whether the engine
+	 * hands back a cached posed model or a freshly built one.
+	 */
+	private void updateTintedBolts()
+	{
+		if (tintedBolts.isEmpty() && splashTints.isEmpty())
+		{
+			return;
+		}
+		int cycle = client.getGameCycle();
+		// Painting is gated on the toggle; flight/impact TRACKING is not,
+		// because the pet damage icon attributes hitsplats from it.
+		boolean paint = config.tintThrallBolt() && !tintFailed;
+		short target = JagexColor.rgbToHSL(config.thrallBoltColor().getRGB(), 1.0d);
+		int hue = JagexColor.unpackHue(target);
+		int sat = JagexColor.unpackSaturation(target);
+		int lum = JagexColor.unpackLuminance(target);
+		// How achromatic the target is (black/grey/white have sat 0). For
+		// those, hue carries nothing — the LUMINANCE is the color, so blend
+		// the model's brightness toward it (scaled by its own shading).
+		// Fully saturated picks keep the original luminance untouched,
+		// which is the look that already read well.
+		float achroma = 1f - sat / (float) JagexColor.SATURATION_MAX;
+		try
+		{
+			for (Iterator<Projectile> it = tintedBolts.iterator(); it.hasNext(); )
+			{
+				Projectile pr = it.next();
+				if (cycle >= pr.getEndCycle())
+				{
+					// Landing: the spotanim that starts on the victim at
+					// this cycle is our impact splash — tint it too. The
+					// hit-claim carries over from the in-flight phase.
+					boolean claimed = claimedBolts.remove(pr);
+					Actor victim = pr.getTargetActor();
+					if (victim != null && splashTints.size() < 16)
+					{
+						splashTints.add(new SplashTint(victim, pr.getEndCycle(), claimed));
+					}
+					it.remove();
+					continue;
+				}
+				Model m = paint ? pr.getModel() : null;
+				if (m != null)
+				{
+					tintModel(m, hue, sat, lum, achroma);
+				}
+			}
+			for (Iterator<SplashTint> it = splashTints.iterator(); it.hasNext(); )
+			{
+				SplashTint st = it.next();
+				if (cycle > st.impactCycle + 250)
+				{
+					it.remove(); // splash long over (5 s hard cap)
+					continue;
+				}
+				if (!paint)
+				{
+					continue;
+				}
+				for (ActorSpotAnim sa : st.target.getSpotAnims())
+				{
+					if (Math.abs(sa.getStartCycle() - st.impactCycle) <= 4)
+					{
+						Model m = sa.getModel();
+						if (m != null)
+						{
+							tintModel(m, hue, sat, lum, achroma);
+						}
+					}
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			tintFailed = true;
+			clearTintedBolts();
+			log.debug("Thrall bolt tint disabled", ex);
+		}
+	}
+
+	/**
+	 * Move every face color's hue and saturation to the target while
+	 * keeping its luminance (the shading) — the bolt keeps its exact shape,
+	 * animation, and shading, just in the new color. Face-color conventions
+	 * from the engine: faceColors3 == -2 means the face is hidden, -1 means
+	 * flat shading (only faceColors1 is used). Idempotent, so per-frame
+	 * reapplication is safe. Originals are snapshotted for restore.
+	 */
+	private void tintModel(Model m, int hue, int sat, int lum, float achroma)
+	{
+		int[] c1 = m.getFaceColors1();
+		int[] c2 = m.getFaceColors2();
+		int[] c3 = m.getFaceColors3();
+		// ALWAYS recompute from the snapshotted originals, never from the
+		// current (already-tinted) colors: the luminance blend is not
+		// idempotent, so cumulative per-frame reapplication decays every
+		// not-fully-saturated color to near-black within one flight.
+		TintSnapshot snap = tintOriginals.get(c1);
+		if (snap == null)
+		{
+			if (tintOriginals.size() >= 128)
+			{
+				return; // snapshot budget exhausted; leave this model alone
+			}
+			snap = new TintSnapshot(c1, c2, c3);
+			tintOriginals.put(c1, snap);
+		}
+		for (int i = 0; i < c1.length; i++)
+		{
+			int f3 = snap.o3[i];
+			if (f3 == -2)
+			{
+				continue;
+			}
+			c1[i] = tintHsl(snap.o1[i], hue, sat, lum, achroma);
+			if (f3 != -1)
+			{
+				c2[i] = tintHsl(snap.o2[i], hue, sat, lum, achroma);
+				c3[i] = tintHsl(f3, hue, sat, lum, achroma);
+			}
+		}
+	}
+
+	/** One packed HSL value re-hued; see tintModel for the luminance rule. */
+	private static int tintHsl(int hsl, int hue, int sat, int lum, float achroma)
+	{
+		int lo = JagexColor.unpackLuminance((short) hsl);
+		if (achroma > 0f)
+		{
+			// Target luminance carrying the model's own shading pattern.
+			int scaled = Math.min(JagexColor.LUMINANCE_MAX, lum * lo / 96);
+			lo = Math.round(lo * (1f - achroma) + scaled * achroma);
+		}
+		return JagexColor.packHSL(hue, sat, lo) & 0xFFFF;
+	}
+
+	/** Un-tint every repainted model and stop tracking bolts and splashes. */
+	private void clearTintedBolts()
+	{
+		for (TintSnapshot s : tintOriginals.values())
+		{
+			System.arraycopy(s.o1, 0, s.a1, 0, s.o1.length);
+			System.arraycopy(s.o2, 0, s.a2, 0, s.o2.length);
+			System.arraycopy(s.o3, 0, s.a3, 0, s.o3.length);
+		}
+		tintOriginals.clear();
+		tintedBolts.clear();
+		claimedBolts.clear();
+		splashTints.clear();
+		petHits.clear();
+	}
+
+	// ------------------------------------------------------------------
+	// Pet damage icon
+	// ------------------------------------------------------------------
+
+	/**
+	 * A hitsplat landing on a tracked projectile's victim within ~0.7 s of
+	 * the landing cycle is the pet's damage. (The player hitting the same
+	 * target in that same instant would also match — cosmetic and rare.)
+	 */
+	@Subscribe
+	public void onHitsplatApplied(HitsplatApplied e)
+	{
+		if (thrall == null && !impersonating && tintedBolts.isEmpty() && splashTints.isEmpty())
+		{
+			return;
+		}
+		// Slot bookkeeping for EVERY hitsplat on actors we might tag — the
+		// player's own damage occupies slots too, and our icon's position
+		// depends on which slot OUR hit ends up in.
+		int cycle = client.getGameCycle();
+		int[] slots = hitSlots.computeIfAbsent(e.getActor(), a -> new int[4]);
+		int slot = -1;
+		for (int i = 0; i < 4; i++)
+		{
+			if (slots[i] <= cycle)
+			{
+				slot = i;
+				break;
+			}
+		}
+		if (slot == -1)
+		{
+			slot = 0;
+			for (int i = 1; i < 4; i++)
+			{
+				if (slots[i] < slots[slot])
+				{
+					slot = i;
+				}
+			}
+		}
+		slots[slot] = e.getHitsplat().getDisappearsOnGameCycle();
+
+		if (!config.petHitIcon() || petIcon == null)
+		{
+			return;
+		}
+		if (e.getHitsplat().getAmount() > THRALL_MAX_HIT)
+		{
+			return; // can't be the thrall's damage
+		}
+		boolean ours = false;
+		for (SplashTint st : splashTints)
+		{
+			if (!st.hitClaimed && st.target == e.getActor() && Math.abs(cycle - st.impactCycle) <= 35)
+			{
+				st.hitClaimed = true;
+				ours = true;
+				break;
+			}
+		}
+		if (!ours)
+		{
+			for (Projectile pr : tintedBolts)
+			{
+				if (!claimedBolts.contains(pr) && pr.getTargetActor() == e.getActor()
+					&& Math.abs(cycle - pr.getEndCycle()) <= 35)
+				{
+					claimedBolts.add(pr);
+					ours = true;
+					break;
+				}
+			}
+		}
+		if (ours && petHits.size() < 8)
+		{
+			// The icon lives and dies with its hitsplat, to the cycle.
+			petHits.add(new PetHit(e.getActor(), e.getHitsplat().getDisappearsOnGameCycle(), slot));
+		}
+	}
+
+	/**
+	 * Resolve the displayed pet's inventory-item sprite (see the field
+	 * comment for the matching rules). The one-time name scan runs on the
+	 * client thread and is persisted per pet, misses included.
+	 */
+	private void resolvePetIcon(int npcId)
+	{
+		if (npcId == petIconKeyId)
+		{
+			return;
+		}
+		petIconKeyId = npcId;
+		petIcon = null;
+		Integer saved = configManager.getConfiguration("petfollower", "petItem_" + npcId, Integer.class);
+		int itemId = saved != null ? saved : findPetItem(displayedPetName());
+		if (saved == null)
+		{
+			configManager.setConfiguration("petfollower", "petItem_" + npcId, itemId);
+		}
+		if (itemId >= 0)
+		{
+			petIcon = itemManager.getImage(itemId);
+		}
+	}
+
+	/** Scan item names for the pet's item: exact match, else longest contained. */
+	private int findPetItem(String petName)
+	{
+		String want = petName.toLowerCase();
+		int best = -1;
+		int bestLen = 3; // ignore trivially short names
+		for (int i = 0; i < 30500; i++)
+		{
+			try
+			{
+				ItemComposition ic = itemManager.getItemComposition(i);
+				String n = ic != null ? ic.getName() : null;
+				if (n == null || "null".equalsIgnoreCase(n))
+				{
+					continue;
+				}
+				if (n.equalsIgnoreCase(petName))
+				{
+					return i;
+				}
+				if (n.length() > bestLen && want.contains(n.toLowerCase()))
+				{
+					best = i;
+					bestLen = n.length();
+				}
+			}
+			catch (Exception ex)
+			{
+				// invalid id — skip
+			}
+		}
+		log.debug("Pet icon for '{}' -> item {}", petName, best);
+		return best;
+	}
+
+	/** Draws the pet icon beside its recent hitsplats. */
+	private class PetHitOverlay extends Overlay
+	{
+		PetHitOverlay()
+		{
+			setPosition(OverlayPosition.DYNAMIC);
+			setLayer(OverlayLayer.ABOVE_SCENE);
+		}
+
+		@Override
+		public Dimension render(Graphics2D g)
+		{
+			if (petHits.isEmpty() || petIcon == null || !config.petHitIcon())
+			{
+				return null;
+			}
+			int cycle = client.getGameCycle();
+			for (Iterator<PetHit> it = petHits.iterator(); it.hasNext(); )
+			{
+				PetHit ph = it.next();
+				if (cycle >= ph.untilCycle)
+				{
+					it.remove();
+					continue;
+				}
+				try
+				{
+					// Our hitsplat's rank among the ACTIVE slots gives how
+					// many splats sit under it; the icon's midline lands on
+					// that splat's midline (anchor minus rank spacings).
+					int rank = 0;
+					int[] slots = hitSlots.get(ph.target);
+					if (slots != null)
+					{
+						for (int i = 0; i < ph.slot; i++)
+						{
+							if (slots[i] > cycle)
+							{
+								rank++;
+							}
+						}
+					}
+					net.runelite.api.Point p = ph.target.getCanvasImageLocation(
+						petIcon, ph.target.getLogicalHeight() / 2);
+					if (p != null)
+					{
+						int cx = p.getX() + petIcon.getWidth() / 2;
+						int cy = p.getY() + petIcon.getHeight() / 2;
+						int w = Math.max(8, config.petHitIconSize());
+						int h = w * 22 / 26;
+						g.drawImage(petIcon, cx + 12, cy - rank * HIT_SLOT_SPACING - h / 2, w, h, null);
+					}
+				}
+				catch (Exception ex)
+				{
+					it.remove(); // actor gone mid-render
+				}
+			}
+			return null;
 		}
 	}
 
@@ -1747,13 +2501,19 @@ public class PetFollowerPlugin extends Plugin
 		{
 			int desired = jau(ldx, ldy);
 
-			// Lean the facing a little toward the player so the pet reads
-			// as watching you through the turn (capped: never strafes).
-			// Aim the lean at the SMOOTHED player position: leaning at the
-			// raw position twitched the whole body the instant you sidestep,
-			// which read as the pet reacting inhumanly fast.
-			if (pathSmoothInit)
+			if (config.alwaysFaceOwner() && pathSmoothInit)
 			{
+				// Full owner-lock: the body points at you even mid-stride.
+				// Aimed at the SMOOTHED position so sidesteps can't twitch it.
+				desired = jau(pathSmoothX - nx, pathSmoothY - ny);
+			}
+			else if (pathSmoothInit)
+			{
+				// Lean the facing a little toward the player so the pet reads
+				// as watching you through the turn (capped: never strafes).
+				// Aim the lean at the SMOOTHED player position: leaning at the
+				// raw position twitched the whole body the instant you sidestep,
+				// which read as the pet reacting inhumanly fast.
 				int toPlayer = jau(pathSmoothX - nx, pathSmoothY - ny);
 				int bias = (int) (wrapAngle(toPlayer - desired) * PLAYER_BIAS);
 				bias = Math.max(-PLAYER_BIAS_CAP, Math.min(PLAYER_BIAS_CAP, bias));
@@ -1775,6 +2535,65 @@ public class PetFollowerPlugin extends Plugin
 		ghostX = nx;
 		ghostY = ny;
 		place(new LocalPoint(Math.round(nx), Math.round(ny)), pathPlane);
+	}
+
+	/**
+	 * A scene reload shifted the local coordinate origin. Translate ALL of
+	 * the ghost's local-space state into the new frame so it glides through
+	 * loading lines mid-stride — speed, route, facing, and rest state all
+	 * untouched. A big world jump at the same moment is a real teleport
+	 * instead: clean repark (gliding across the world map would be worse),
+	 * resuming at speed rather than with the standing-start beat.
+	 */
+	private void applySceneShift()
+	{
+		if (ghost == null)
+		{
+			return;
+		}
+		Player me = client.getLocalPlayer();
+		WorldPoint now = me != null ? me.getWorldLocation() : null;
+		int jump = now != null && lastPlayerTile != null ? lastPlayerTile.distanceTo(now) : 99;
+		if (jump > 10)
+		{
+			resumeAtSpeed = hidingReal;
+			releasePet();
+			despawnGhost();
+			hidingReal = false;
+			return;
+		}
+
+		float dx = -(client.getBaseX() - lastBaseX) * (float) Perspective.LOCAL_TILE_SIZE;
+		float dy = -(client.getBaseY() - lastBaseY) * (float) Perspective.LOCAL_TILE_SIZE;
+		if (dx != 0f || dy != 0f)
+		{
+			ghostX += dx;
+			ghostY += dy;
+			pathSmoothX += dx;
+			pathSmoothY += dy;
+			restX += dx;
+			restY += dy;
+			Deque<PathPoint> shifted = new ArrayDeque<>(path.size());
+			for (PathPoint pp : path)
+			{
+				shifted.addLast(new PathPoint(pp.x + dx, pp.y + dy, pp.cum));
+			}
+			path.clear();
+			path.addAll(shifted);
+		}
+		// Registration can be scene-scoped: cycle it, then reseat on the
+		// new scene's terrain.
+		if (ghostShown)
+		{
+			client.removeRuneLiteObject(ghost);
+			client.registerRuneLiteObject(ghost);
+		}
+		pathPlane = client.getPlane();
+		place(new LocalPoint(Math.round(ghostX), Math.round(ghostY)), pathPlane);
+		if (blipActive)
+		{
+			syncBlip();
+		}
 	}
 
 	/**
@@ -2012,6 +2831,15 @@ public class PetFollowerPlugin extends Plugin
 		playerSpeed = 0f;
 		ghostArc = 0f;
 		ghostV = 0f;
+		if (resumeAtSpeed)
+		{
+			// Interrupted mid-run: appear already walking. A nonzero speed
+			// bypasses the standing-start reaction gate, and the normal
+			// speed curve takes over from the very next frame (it also
+			// eases straight back to a stop if you actually stood still).
+			ghostV = WALK_SPEED;
+			resumeAtSpeed = false;
+		}
 		turnV = 0f;
 		lastFrameNanos = System.nanoTime();
 		ghostX = petPos.getX();
@@ -2155,7 +2983,8 @@ public class PetFollowerPlugin extends Plugin
 		}
 		LocalPoint at = new LocalPoint(Math.round(ghostX), Math.round(ghostY));
 		blipObj.setLocation(at, pathPlane);
-		blipObj.setZ(Perspective.getFootprintTileHeight(client, at, pathPlane, ghostSize));
+		blipObj.setZ(Perspective.getFootprintTileHeight(client, at, pathPlane, ghostSize)
+			- config.groundClearance());
 		blipObj.setOrientation(ghost.getOrientation());
 
 		// Speed-up for the stand-in: feed extra time into the controller's
@@ -2268,7 +3097,10 @@ public class PetFollowerPlugin extends Plugin
 		// real NPC: footprint-averaged height, so wide flat pets (Scorpia's
 		// offspring etc.) don't sink into slopes. Uses the size captured at
 		// spawn so it stays correct even while the pet is a render blip.
-		int z = Perspective.getFootprintTileHeight(client, at, plane, ghostSize);
+		// Negative Z is up; the clearance lifts base-level glows/auras just
+		// above the terrain plane so the ground can't swallow them.
+		int z = Perspective.getFootprintTileHeight(client, at, plane, ghostSize)
+			- config.groundClearance();
 		ghost.setZ(z);
 		if (blipActive && blipObj != null)
 		{
@@ -2410,10 +3242,57 @@ public class PetFollowerPlugin extends Plugin
 		loadPetSpeed();
 	}
 
+	/** Apply the selected follow style, easing the trailing-distance drift. */
+	private void updateFollowStyle(float dt)
+	{
+		float driftAmp;
+		switch (config.followStyle())
+		{
+			case LOOSE:
+				followStartDist = 256f;
+				followSlope = 700f;
+				followSmoothTau = 320f;
+				followSettleTicks = 5;
+				driftAmp = 90f;
+				break;
+			case MEDIUM:
+				followStartDist = 128f;
+				followSlope = 500f;
+				followSmoothTau = 230f;
+				followSettleTicks = 3;
+				driftAmp = 45f;
+				break;
+			default:
+				followStartDist = START_DIST;
+				followSlope = 350f;
+				followSmoothTau = PATH_SMOOTH_TAU;
+				followSettleTicks = 2;
+				driftAmp = 0f;
+				break;
+		}
+
+		if (driftAmp <= 0f)
+		{
+			gapDrift = 0f;
+			gapDriftTarget = 0f;
+			return;
+		}
+		long now = System.currentTimeMillis();
+		if (now >= gapDriftRetargetMs)
+		{
+			// Only ever ADDS distance (drifting closer than the base gap
+			// would nose into the player); eased over ~1.5 s so the change
+			// reads as the pet ambling, not snapping.
+			gapDriftTarget = followRng.nextFloat() * driftAmp;
+			gapDriftRetargetMs = now + 3000 + followRng.nextInt(5000);
+		}
+		gapDrift += (gapDriftTarget - gapDrift) * Math.min(1f, dt / 1500f);
+	}
+
 	/**
-	 * Load the displayed pet's remembered cadence setting and reflect it in
-	 * the config slider, so the slider always shows and edits the pet you
-	 * actually have out (or are transmogged to).
+	 * Load the displayed pet's remembered settings (cadence, clearance) and
+	 * reflect them in the config sliders, so the sliders always show and
+	 * edit the pet you actually have out (or are transmogged to).
 	 */
 	private void loadPetSpeed()
 	{
@@ -2434,6 +3313,27 @@ public class PetFollowerPlugin extends Plugin
 			configManager.setConfiguration("petfollower", "petSpeed", petSpeedPct);
 			syncingSpeedUi = false;
 		}
+		// Ground clearance is per-pet too — synced silently, no chat line.
+		Integer savedClr = configManager.getConfiguration("petfollower", "clearance_" + id, Integer.class);
+		int clr = Math.max(0, Math.min(32, savedClr != null ? savedClr : 0));
+		if (config.groundClearance() != clr)
+		{
+			syncingSpeedUi = true;
+			configManager.setConfiguration("petfollower", "groundClearance", clr);
+			syncingSpeedUi = false;
+		}
+		// Projectile tint color is per-pet as well (red Hunllef, green Olm
+		// jr, ...). A pet with no saved color keeps whatever is set, and
+		// only gets its own entry once the user picks a color for it.
+		java.awt.Color savedTint = configManager.getConfiguration("petfollower", "boltColor_" + id, java.awt.Color.class);
+		if (savedTint != null && !savedTint.equals(config.thrallBoltColor()))
+		{
+			syncingSpeedUi = true;
+			configManager.setConfiguration("petfollower", "thrallBoltColor", savedTint);
+			syncingSpeedUi = false;
+		}
+		// Keep the damage-icon sprite in step with the displayed pet.
+		resolvePetIcon(id);
 		// Announce the loaded profile in the chatbox whenever the displayed
 		// pet changes: an already-OPEN config panel does not repaint when a
 		// plugin changes a value under it, so the slider can look stale
@@ -2479,6 +3379,29 @@ public class PetFollowerPlugin extends Plugin
 			{
 				configManager.setConfiguration("petfollower", "petSpeed_" + speedKeyId, petSpeedPct);
 			}
+		}
+		// Same for the ground-clearance slider.
+		if ("groundClearance".equals(e.getKey()) && !syncingSpeedUi && speedKeyId >= 0)
+		{
+			configManager.setConfiguration("petfollower", "clearance_" + speedKeyId, config.groundClearance());
+		}
+		// User picked a tint color: persist it for the displayed pet.
+		if ("thrallBoltColor".equals(e.getKey()) && !syncingSpeedUi && speedKeyId >= 0)
+		{
+			configManager.setConfiguration("petfollower", "boltColor_" + speedKeyId, config.thrallBoltColor());
+		}
+		// Bolt tint toggled or recolored: restore every repainted model to
+		// its original colors (the engine caches posed models — merely
+		// stopping the repaint would leave them tinted), drop tracking, and
+		// give a failed tint another chance. In-flight bolts revert; the
+		// next cast uses the new settings.
+		if ("tintThrallBolt".equals(e.getKey()) || "thrallBoltColor".equals(e.getKey()))
+		{
+			clientThread.invoke(() ->
+			{
+				clearTintedBolts();
+				tintFailed = false;
+			});
 		}
 	}
 
@@ -2582,6 +3505,8 @@ public class PetFollowerPlugin extends Plugin
 			// Just drop the stale reference so the ghost freezes on its cached
 			// model. onGameTick's grace period re-links the pet when it comes
 			// back, or tears down if it's really gone — no blink/respawn.
+			// Its stashed 117HD light must die with the NPC instance.
+			hdShimDrop();
 			pet = null;
 			animsHijacked = false;
 		}
@@ -2611,25 +3536,222 @@ public class PetFollowerPlugin extends Plugin
 	public void onGameStateChanged(GameStateChanged e)
 	{
 		GameState s = e.getGameState();
-		if (s == GameState.LOADING || s == GameState.HOPPING || s == GameState.LOGIN_SCREEN)
+		if (s == GameState.LOADING)
 		{
-			// LocalPoints are invalid across scene loads; rebuild lazily. A
-			// thrall that outlives a same-world region change (teleport) keeps
-			// its impersonation and is re-found next tick; a world hop / login
-			// is a clean slate.
-			boolean regionChange = s == GameState.LOADING;
-			rescanThrall = regionChange && impersonating && config.thrallMode();
+			// Region crossing (or teleport). The ghost is NOT torn down: its
+			// local-space state gets translated into the new scene's frame on
+			// the next rendered frame (applySceneShift), so it glides through
+			// loading lines mid-stride — speed, route, and facing untouched.
+			// (Tearing it down here was the visible "pet respawns at every
+			// loading line" pop, worst on loose follow styles.) Thrall and
+			// bolt tracking still reset — NPC/projectile instances don't
+			// survive the reload; they re-acquire right after.
+			rescanThrall = impersonating && config.thrallMode();
+			hdShimDrop();
+			clearTintedBolts();
+			thrall = null;
+			thrallAttached = false;
+			if (ghost != null)
+			{
+				pendingSceneShift = true;
+			}
+		}
+		else if (s == GameState.HOPPING || s == GameState.LOGIN_SCREEN)
+		{
+			// World hop / logout: a clean slate.
+			rescanThrall = false;
+			resumeAtSpeed = false;
 			releasePet();
 			despawnGhost();
 			hidingReal = false;
+			hdShimDrop();
+			clearTintedBolts();
 			thrall = null;
 			thrallAttached = false;
-			if (!regionChange)
+			impersonating = false;
+			thrallLostTicks = 0;
+		}
+	}
+
+	// ------------------------------------------------------------------
+	// 117HD pet-light shim
+	// ------------------------------------------------------------------
+
+	/** Lift our hidden pet's (and thrall's) lights out of 117HD's scene. */
+	private void hdShimSweep()
+	{
+		// ghost == null means nothing is being impersonated right now (e.g.
+		// thrall up with no pet out) — every light belongs where it is.
+		if (hdShimFailed || ghost == null || (pet == null && thrall == null))
+		{
+			return;
+		}
+		try
+		{
+			if (hdGetSceneContext == null && !hdShimInit())
 			{
-				impersonating = false;
-				thrallLostTicks = 0;
+				return;
+			}
+			Object ctx = hdGetSceneContext.invoke(hdPluginInstance);
+			if (ctx == null)
+			{
+				return; // scene not built yet
+			}
+			// The scene was rebuilt under a live stash: those Light objects
+			// belong to a dead context (117HD re-created its own) — drop.
+			if (!hdStashed.isEmpty() && hdStashContext != ctx)
+			{
+				hdStashed.clear();
+			}
+			@SuppressWarnings("unchecked")
+			List<Object> lights = (List<Object>) hdLightsField.get(ctx);
+			for (Iterator<Object> it = lights.iterator(); it.hasNext(); )
+			{
+				Object light = it.next();
+				Object actor = hdLightActorField.get(light);
+				if (actor != null && (actor == pet || actor == thrall))
+				{
+					it.remove();
+					hdStashed.add(light);
+					hdStashContext = ctx;
+				}
 			}
 		}
+		catch (Exception ex)
+		{
+			hdShimFailed = true;
+			log.debug("117HD light shim disabled", ex);
+		}
+	}
+
+	/** Hand the stashed lights back to 117HD (pet is visible again). */
+	private void hdShimRestore()
+	{
+		if (hdStashed.isEmpty())
+		{
+			return;
+		}
+		try
+		{
+			Object ctx = hdGetSceneContext != null ? hdGetSceneContext.invoke(hdPluginInstance) : null;
+			// Only restore into the SAME scene the lights were taken from;
+			// a fresh scene already rebuilt its own lights (restoring stale
+			// ones would duplicate the glow).
+			if (ctx != null && ctx == hdStashContext)
+			{
+				@SuppressWarnings("unchecked")
+				List<Object> lights = (List<Object>) hdLightsField.get(ctx);
+				lights.addAll(hdStashed);
+			}
+		}
+		catch (Exception ex)
+		{
+			hdShimFailed = true;
+		}
+		hdStashed.clear();
+	}
+
+	/** Discard stashed lights — scene reload or pet gone; never restore stale. */
+	private void hdShimDrop()
+	{
+		hdStashed.clear();
+	}
+
+	/**
+	 * Locate 117HD's live light list and Light.actor field by reflection.
+	 * Returns false quietly while 117HD is absent or not started (retried
+	 * every few seconds); marks the shim failed on any structural mismatch.
+	 */
+	private boolean hdShimInit() throws Exception
+	{
+		long now = System.currentTimeMillis();
+		if (now < hdNextInitMs)
+		{
+			return false;
+		}
+		hdNextInitMs = now + 5000;
+
+		Plugin hd = null;
+		for (Plugin pl : pluginManager.getPlugins())
+		{
+			if ("rs117.hd.HdPlugin".equals(pl.getClass().getName()))
+			{
+				hd = pl;
+				break;
+			}
+		}
+		if (hd == null || !pluginManager.isPluginEnabled(hd))
+		{
+			return false;
+		}
+
+		ClassLoader cl = hd.getClass().getClassLoader();
+		Class<?> lightClass = Class.forName("rs117.hd.scene.lights.Light", false, cl);
+		Class<?> ctxClass = Class.forName("rs117.hd.scene.SceneContext", false, cl);
+
+		// The ACTIVE rendered lights are SceneContext.lights; HdPlugin
+		// exposes the current context via its PUBLIC getSceneContext()
+		// (it lives on the renderer, not as a plugin field — scanning for
+		// a field was this shim's second silently-wrong aim; LightManager's
+		// WORLD_LIGHTS definitions list was the first).
+		java.lang.reflect.Method getCtx;
+		try
+		{
+			getCtx = hd.getClass().getMethod("getSceneContext");
+		}
+		catch (NoSuchMethodException nsm)
+		{
+			getCtx = null;
+		}
+		if (getCtx == null || !ctxClass.isAssignableFrom(getCtx.getReturnType()))
+		{
+			hdShimFailed = true;
+			log.debug("117HD light shim: no usable getSceneContext()");
+			return false;
+		}
+
+		Field lightsField = null;
+		try
+		{
+			lightsField = ctxClass.getDeclaredField("lights");
+			lightsField.setAccessible(true);
+			Type g = lightsField.getGenericType();
+			if (!(g instanceof ParameterizedType)
+				|| ((ParameterizedType) g).getActualTypeArguments()[0] != lightClass)
+			{
+				lightsField = null; // not the List<Light> we expect
+			}
+		}
+		catch (NoSuchFieldException nsf)
+		{
+			lightsField = null;
+		}
+
+		// Light.actor — the field tying a light to its NPC.
+		Field actorField = null;
+		for (Field f : lightClass.getDeclaredFields())
+		{
+			if (net.runelite.api.Actor.class.isAssignableFrom(f.getType()))
+			{
+				f.setAccessible(true);
+				actorField = f;
+				break;
+			}
+		}
+
+		if (lightsField == null || actorField == null)
+		{
+			hdShimFailed = true;
+			log.debug("117HD light shim: structure mismatch (lights={}, actor={})",
+				lightsField != null, actorField != null);
+			return false;
+		}
+		hdPluginInstance = hd;
+		hdGetSceneContext = getCtx;
+		hdLightsField = lightsField;
+		hdLightActorField = actorField;
+		log.debug("117HD light shim active (SceneContext.lights via getSceneContext)");
+		return true;
 	}
 
 	// ------------------------------------------------------------------
