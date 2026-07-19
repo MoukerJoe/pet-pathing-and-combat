@@ -4,9 +4,6 @@ import com.google.inject.Provides;
 import java.awt.Dimension;
 import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
-import java.lang.reflect.Field;
-import java.lang.reflect.ParameterizedType;
-import java.lang.reflect.Type;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -58,7 +55,6 @@ import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
-import net.runelite.client.plugins.PluginManager;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayManager;
@@ -221,7 +217,6 @@ public class PetFollowerPlugin extends Plugin
 	@Inject private Hooks hooks;
 	@Inject private PetFollowerConfig config;
 	@Inject private ConfigManager configManager;
-	@Inject private PluginManager pluginManager;
 	@Inject private ItemManager itemManager;
 	@Inject private OverlayManager overlayManager;
 
@@ -367,24 +362,6 @@ public class PetFollowerPlugin extends Plugin
 	private int petSpeedPct = 100;
 	private int speedKeyId = -1;
 	private boolean syncingSpeedUi;
-
-	// --- 117HD pet-light shim (reflection) -----------------------------
-	// 117HD attaches glow lights to some pets, positioned at the REAL
-	// (hidden) pet — a floating glow where nothing is drawn. It exposes no
-	// API to move or hide a single light, so this shim lifts OUR pet's
-	// (and hidden thrall's) Light objects out of 117HD's live scene-light
-	// list while ghosting, and puts the SAME objects back on handback.
-	// Scoped to the followed pet only — every other NPC light untouched.
-	// Fails safe: any mismatch with 117HD's internals disables the shim
-	// for the session (worst case = the old floating light, never a crash).
-	private boolean hdShimFailed;
-	private Object hdPluginInstance;
-	private java.lang.reflect.Method hdGetSceneContext; // HdPlugin.getSceneContext() (public)
-	private Field hdLightsField;         // SceneContext.lights — the RENDERED lights
-	private Field hdLightActorField;     // Light.actor
-	private final List<Object> hdStashed = new ArrayList<>();
-	private Object hdStashContext;       // SceneContext the stash was taken from
-	private long hdNextInitMs;
 
 	// Beside-the-owner rest: when you stop, the ghost breaks off the walked
 	// line for its last half-tile and settles on a free adjacent tile
@@ -552,7 +529,6 @@ public class PetFollowerPlugin extends Plugin
 		hidingReal = false;
 		clientThread.invoke(() ->
 		{
-			hdShimRestore();
 			clearTintedBolts();
 			releasePet();
 			despawnGhost();
@@ -772,11 +748,6 @@ public class PetFollowerPlugin extends Plugin
 			lastBaseX = client.getBaseX();
 			lastBaseY = client.getBaseY();
 		}
-		if (!hidingReal)
-		{
-			// Pet is visible again: hand its 117HD light back.
-			hdShimRestore();
-		}
 		// Bolts in flight outlive state changes (handoff, thrall expiry), so
 		// they update before any early return below.
 		updateTintedBolts();
@@ -796,10 +767,6 @@ public class PetFollowerPlugin extends Plugin
 		{
 			return;
 		}
-
-		// While ghosting, keep our hidden pet's 117HD glow suppressed so it
-		// can't float at the real (invisible) pet's position.
-		hdShimSweep();
 
 		// --- transmog preview state --------------------------------------
 		// When a preview id is set, the follower renders as THAT pet: the
@@ -3505,8 +3472,6 @@ public class PetFollowerPlugin extends Plugin
 			// Just drop the stale reference so the ghost freezes on its cached
 			// model. onGameTick's grace period re-links the pet when it comes
 			// back, or tears down if it's really gone — no blink/respawn.
-			// Its stashed 117HD light must die with the NPC instance.
-			hdShimDrop();
 			pet = null;
 			animsHijacked = false;
 		}
@@ -3547,7 +3512,6 @@ public class PetFollowerPlugin extends Plugin
 			// bolt tracking still reset — NPC/projectile instances don't
 			// survive the reload; they re-acquire right after.
 			rescanThrall = impersonating && config.thrallMode();
-			hdShimDrop();
 			clearTintedBolts();
 			thrall = null;
 			thrallAttached = false;
@@ -3564,194 +3528,12 @@ public class PetFollowerPlugin extends Plugin
 			releasePet();
 			despawnGhost();
 			hidingReal = false;
-			hdShimDrop();
 			clearTintedBolts();
 			thrall = null;
 			thrallAttached = false;
 			impersonating = false;
 			thrallLostTicks = 0;
 		}
-	}
-
-	// ------------------------------------------------------------------
-	// 117HD pet-light shim
-	// ------------------------------------------------------------------
-
-	/** Lift our hidden pet's (and thrall's) lights out of 117HD's scene. */
-	private void hdShimSweep()
-	{
-		// ghost == null means nothing is being impersonated right now (e.g.
-		// thrall up with no pet out) — every light belongs where it is.
-		if (hdShimFailed || ghost == null || (pet == null && thrall == null))
-		{
-			return;
-		}
-		try
-		{
-			if (hdGetSceneContext == null && !hdShimInit())
-			{
-				return;
-			}
-			Object ctx = hdGetSceneContext.invoke(hdPluginInstance);
-			if (ctx == null)
-			{
-				return; // scene not built yet
-			}
-			// The scene was rebuilt under a live stash: those Light objects
-			// belong to a dead context (117HD re-created its own) — drop.
-			if (!hdStashed.isEmpty() && hdStashContext != ctx)
-			{
-				hdStashed.clear();
-			}
-			@SuppressWarnings("unchecked")
-			List<Object> lights = (List<Object>) hdLightsField.get(ctx);
-			for (Iterator<Object> it = lights.iterator(); it.hasNext(); )
-			{
-				Object light = it.next();
-				Object actor = hdLightActorField.get(light);
-				if (actor != null && (actor == pet || actor == thrall))
-				{
-					it.remove();
-					hdStashed.add(light);
-					hdStashContext = ctx;
-				}
-			}
-		}
-		catch (Exception ex)
-		{
-			hdShimFailed = true;
-			log.debug("117HD light shim disabled", ex);
-		}
-	}
-
-	/** Hand the stashed lights back to 117HD (pet is visible again). */
-	private void hdShimRestore()
-	{
-		if (hdStashed.isEmpty())
-		{
-			return;
-		}
-		try
-		{
-			Object ctx = hdGetSceneContext != null ? hdGetSceneContext.invoke(hdPluginInstance) : null;
-			// Only restore into the SAME scene the lights were taken from;
-			// a fresh scene already rebuilt its own lights (restoring stale
-			// ones would duplicate the glow).
-			if (ctx != null && ctx == hdStashContext)
-			{
-				@SuppressWarnings("unchecked")
-				List<Object> lights = (List<Object>) hdLightsField.get(ctx);
-				lights.addAll(hdStashed);
-			}
-		}
-		catch (Exception ex)
-		{
-			hdShimFailed = true;
-		}
-		hdStashed.clear();
-	}
-
-	/** Discard stashed lights — scene reload or pet gone; never restore stale. */
-	private void hdShimDrop()
-	{
-		hdStashed.clear();
-	}
-
-	/**
-	 * Locate 117HD's live light list and Light.actor field by reflection.
-	 * Returns false quietly while 117HD is absent or not started (retried
-	 * every few seconds); marks the shim failed on any structural mismatch.
-	 */
-	private boolean hdShimInit() throws Exception
-	{
-		long now = System.currentTimeMillis();
-		if (now < hdNextInitMs)
-		{
-			return false;
-		}
-		hdNextInitMs = now + 5000;
-
-		Plugin hd = null;
-		for (Plugin pl : pluginManager.getPlugins())
-		{
-			if ("rs117.hd.HdPlugin".equals(pl.getClass().getName()))
-			{
-				hd = pl;
-				break;
-			}
-		}
-		if (hd == null || !pluginManager.isPluginEnabled(hd))
-		{
-			return false;
-		}
-
-		ClassLoader cl = hd.getClass().getClassLoader();
-		Class<?> lightClass = Class.forName("rs117.hd.scene.lights.Light", false, cl);
-		Class<?> ctxClass = Class.forName("rs117.hd.scene.SceneContext", false, cl);
-
-		// The ACTIVE rendered lights are SceneContext.lights; HdPlugin
-		// exposes the current context via its PUBLIC getSceneContext()
-		// (it lives on the renderer, not as a plugin field — scanning for
-		// a field was this shim's second silently-wrong aim; LightManager's
-		// WORLD_LIGHTS definitions list was the first).
-		java.lang.reflect.Method getCtx;
-		try
-		{
-			getCtx = hd.getClass().getMethod("getSceneContext");
-		}
-		catch (NoSuchMethodException nsm)
-		{
-			getCtx = null;
-		}
-		if (getCtx == null || !ctxClass.isAssignableFrom(getCtx.getReturnType()))
-		{
-			hdShimFailed = true;
-			log.debug("117HD light shim: no usable getSceneContext()");
-			return false;
-		}
-
-		Field lightsField = null;
-		try
-		{
-			lightsField = ctxClass.getDeclaredField("lights");
-			lightsField.setAccessible(true);
-			Type g = lightsField.getGenericType();
-			if (!(g instanceof ParameterizedType)
-				|| ((ParameterizedType) g).getActualTypeArguments()[0] != lightClass)
-			{
-				lightsField = null; // not the List<Light> we expect
-			}
-		}
-		catch (NoSuchFieldException nsf)
-		{
-			lightsField = null;
-		}
-
-		// Light.actor — the field tying a light to its NPC.
-		Field actorField = null;
-		for (Field f : lightClass.getDeclaredFields())
-		{
-			if (net.runelite.api.Actor.class.isAssignableFrom(f.getType()))
-			{
-				f.setAccessible(true);
-				actorField = f;
-				break;
-			}
-		}
-
-		if (lightsField == null || actorField == null)
-		{
-			hdShimFailed = true;
-			log.debug("117HD light shim: structure mismatch (lights={}, actor={})",
-				lightsField != null, actorField != null);
-			return false;
-		}
-		hdPluginInstance = hd;
-		hdGetSceneContext = getCtx;
-		hdLightsField = lightsField;
-		hdLightActorField = actorField;
-		log.debug("117HD light shim active (SceneContext.lights via getSceneContext)");
-		return true;
 	}
 
 	// ------------------------------------------------------------------
