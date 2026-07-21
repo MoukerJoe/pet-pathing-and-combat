@@ -254,6 +254,13 @@ public class PetFollowerPlugin extends Plugin
 	private boolean pendingSceneShift;
 	private int lastBaseX;
 	private int lastBaseY;
+	// Player's world tile captured the INSTANT loading starts. The
+	// walk-vs-teleport classification must compare against this, never
+	// against lastPlayerTile at resolve time: a post-load game tick can
+	// fire before our first rendered frame and overwrite lastPlayerTile
+	// with the arrival position — the comparison then sees "no jump" and
+	// mistranslates a teleport (ghost stranded off-scene, then slingshot).
+	private WorldPoint pendingShiftFrom;
 	private float ghostX;
 	private float ghostY;
 	private float turnV;
@@ -2516,17 +2523,21 @@ public class PetFollowerPlugin extends Plugin
 	{
 		if (ghost == null)
 		{
+			pendingShiftFrom = null;
 			return;
 		}
 		Player me = client.getLocalPlayer();
 		WorldPoint now = me != null ? me.getWorldLocation() : null;
-		int jump = now != null && lastPlayerTile != null ? lastPlayerTile.distanceTo(now) : 99;
+		// Compare against the position captured when loading STARTED (see
+		// pendingShiftFrom). Different planes yield MAX_VALUE, so ladders
+		// and stairs that reload the scene classify as teleports and repark.
+		int jump = now != null && pendingShiftFrom != null
+			? pendingShiftFrom.distanceTo(now)
+			: Integer.MAX_VALUE;
+		pendingShiftFrom = null;
 		if (jump > 10)
 		{
-			resumeAtSpeed = hidingReal;
-			releasePet();
-			despawnGhost();
-			hidingReal = false;
+			reparkAfterTeleport();
 			return;
 		}
 
@@ -2548,6 +2559,19 @@ public class PetFollowerPlugin extends Plugin
 			path.clear();
 			path.addAll(shifted);
 		}
+
+		// Belt and braces: if the translation left the ghost far from you
+		// (or off the scene grid entirely), the load was NOT a simple
+		// walk-crossing — whatever the classifier thought. Repark rather
+		// than strand an invisible ghost that later slingshots in.
+		LocalPoint mp = me != null ? me.getLocalLocation() : null;
+		if (mp == null
+			|| Math.hypot(mp.getX() - ghostX, mp.getY() - ghostY) > 15 * Perspective.LOCAL_TILE_SIZE)
+		{
+			reparkAfterTeleport();
+			return;
+		}
+
 		// Registration can be scene-scoped: cycle it, then reseat on the
 		// new scene's terrain.
 		if (ghostShown)
@@ -2561,6 +2585,19 @@ public class PetFollowerPlugin extends Plugin
 		{
 			syncBlip();
 		}
+	}
+
+	/**
+	 * A real teleport (or anything that looks like one): tear the follow
+	 * state down cleanly; the next takeover reparks the ghost behind you,
+	 * setting off at speed instead of the standing-start beat.
+	 */
+	private void reparkAfterTeleport()
+	{
+		resumeAtSpeed = hidingReal;
+		releasePet();
+		despawnGhost();
+		hidingReal = false;
 	}
 
 	/**
@@ -3518,6 +3555,7 @@ public class PetFollowerPlugin extends Plugin
 			if (ghost != null)
 			{
 				pendingSceneShift = true;
+				pendingShiftFrom = lastPlayerTile;
 			}
 		}
 		else if (s == GameState.HOPPING || s == GameState.LOGIN_SCREEN)
